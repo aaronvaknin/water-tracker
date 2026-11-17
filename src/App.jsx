@@ -16,6 +16,8 @@ import {
   Activity,
   FileText,
   ChevronLeft,
+  ChevronDown,
+  ChevronUp,
   AlertTriangle,
   Gauge,
   ShieldCheck,
@@ -33,19 +35,29 @@ import {
   SlidersHorizontal,
   Download,
   Upload,
-  FileSpreadsheet
+  FileSpreadsheet,
+  Bell,
+  QrCode,
+  Printer,
+  Camera,
+  Image as ImageIcon,
+  Filter,
+  ArrowUpDown,
+  ZoomIn
 } from 'lucide-react';
 
 /**
- * Water Dispensers & Tanks Tracker - V3.2.0 PRO (Excel Backup & Custom Renewal Date Edition)
+ * Water Dispensers & Tanks Tracker - V4.0.0 PRO (Field Operations & Offline Suite)
  * -----------------------------------------------------------------------------------------
  * Full-featured SaaS application shell in RTL Hebrew:
  * - Persistent SaaS Sidebar Navigation + Sticky Glassmorphic Top Bar
- * - Hierarchy: Area (אזור) > Location (מקום) > Water Dispenser + Tank + Notes (מתקן מים + מיכל + הערות)
- * - Clean empty initial state (zero sample/mock data) with automatic localStorage persistence
- * - Native Excel (.xlsx) Export & Import Backup with Smart Non-Destructive Merge (no overwrites, no duplicates)
- * - Custom Renewal Date picker inside the Filter Renewal modal + Technician & Escort tracking
- * - Accurate local timezone date formatting & synchronized Light/Dark theme
+ * - Smart Action Center (מרכז התראות ודברים דחופים) for expired/expiring tags, <20% filters, & faults
+ * - Quick Technician & Escort Name History chips inside Filter Renewal modal
+ * - Zero-dependency Offline QR Code Label Generator & Deep-Linking per Dispenser
+ * - Official A4 Printable / PDF Inspection Report (דוח ביקורת רשמי להדפסה / PDF)
+ * - Advanced Dashboard Filtering (Faulty / Expired / Area) & Sorting (Lowest Filter % / Nearest Expiry)
+ * - Mobile Camera Capture & Offline Compressed Photo Documentation per Dispenser
+ * - Native Excel (.xlsx) Export & Non-Destructive Deduplicated Import Backup
  */
 
 const STORAGE_KEY = 'aquaops_water_tracker_v3_state';
@@ -69,6 +81,15 @@ const parseLocalIsoDate = (isoDate) => {
   return isNaN(parsed.getTime()) ? null : parsed;
 };
 
+// Helper: Calculate days from today to a YYYY-MM-DD date string
+const getDaysUntilDate = (isoDate) => {
+  const target = parseLocalIsoDate(isoDate);
+  if (!target) return null;
+  const now = new Date();
+  const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return Math.round((target.getTime() - todayMidnight.getTime()) / (1000 * 60 * 60 * 24));
+};
+
 // Helper: Normalize various date representations (Excel serial, DD/MM/YYYY, YYYY-MM-DD, Date) to YYYY-MM-DD
 const normalizeImportedDate = (rawVal) => {
   if (rawVal === null || rawVal === undefined) return '';
@@ -76,7 +97,6 @@ const normalizeImportedDate = (rawVal) => {
     return getLocalIsoDate(rawVal);
   }
   if (typeof rawVal === 'number' && rawVal > 20000 && rawVal < 100000) {
-    // Convert Excel serial date number to local YYYY-MM-DD
     const utcDays = Math.floor(rawVal - 25569);
     const utcMs = utcDays * 86400 * 1000;
     const d = new Date(utcMs);
@@ -88,13 +108,11 @@ const normalizeImportedDate = (rawVal) => {
   const str = String(rawVal).trim();
   if (!str || str === '-' || str === 'טרם בוצע' || str === '__/__/____') return '';
 
-  // Already YYYY-MM-DD (or starts with YYYY-MM-DD)
   const isoMatch = str.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/);
   if (isoMatch) {
     return `${isoMatch[1]}-${isoMatch[2].padStart(2, '0')}-${isoMatch[3].padStart(2, '0')}`;
   }
 
-  // Israeli format DD/MM/YYYY or D.M.YYYY
   const ilMatch = str.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})/);
   if (ilMatch) {
     return `${ilMatch[3]}-${ilMatch[2].padStart(2, '0')}-${ilMatch[1].padStart(2, '0')}`;
@@ -148,8 +166,415 @@ const loadSavedState = () => {
   }
 };
 
+// Helper: Compress & resize mobile camera / gallery image via HTML5 Canvas for lightweight offline storage
+const compressImageFile = (file, maxDimension = 800, quality = 0.66) => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxDimension || height > maxDimension) {
+          if (width > height) {
+            height = Math.round((height * maxDimension) / width);
+            width = maxDimension;
+          } else {
+            width = Math.round((width * maxDimension) / height);
+            height = maxDimension;
+          }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          reject(new Error('Canvas context unavailable'));
+          return;
+        }
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, width, height);
+        ctx.drawImage(img, 0, 0, width, height);
+        const compressedDataUrl = canvas.toDataURL('image/jpeg', quality);
+        resolve(compressedDataUrl);
+      };
+      img.onerror = () => reject(new Error('Image decode failed'));
+      img.src = event.target?.result;
+    };
+    reader.onerror = () => reject(new Error('File read failed'));
+    reader.readAsDataURL(file);
+  });
+};
+
+// ============================================================================
+// ZERO-DEPENDENCY OFFLINE QR CODE GENERATOR (ISO/IEC 18004 Byte Mode, V1-V10)
+// ============================================================================
+const QR_VERSION_SPECS = [
+  null,
+  { size: 21, totalData: 19, blocks: [[19, 7]], align: [] }, // V1
+  { size: 25, totalData: 34, blocks: [[34, 10]], align: [6, 18] }, // V2
+  { size: 29, totalData: 55, blocks: [[55, 15]], align: [6, 22] }, // V3
+  { size: 33, totalData: 80, blocks: [[80, 20]], align: [6, 26] }, // V4
+  { size: 37, totalData: 108, blocks: [[108, 26]], align: [6, 30] }, // V5
+  { size: 41, totalData: 136, blocks: [[68, 18], [68, 18]], align: [6, 34] }, // V6
+  { size: 45, totalData: 156, blocks: [[78, 20], [78, 20]], align: [6, 22, 38], verBits: 0x07c94 }, // V7
+  { size: 49, totalData: 194, blocks: [[97, 24], [97, 24]], align: [6, 24, 42], verBits: 0x085bc }, // V8
+  { size: 53, totalData: 232, blocks: [[116, 30], [116, 30]], align: [6, 26, 46], verBits: 0x09a99 }, // V9
+  {
+    size: 57,
+    totalData: 274,
+    blocks: [
+      [68, 18],
+      [68, 18],
+      [69, 18],
+      [69, 18]
+    ],
+    align: [6, 28, 50],
+    verBits: 0x0a4d3
+  } // V10
+];
+
+const QR_FORMAT_BITS_L = [0x77c4, 0x72f3, 0x7daa, 0x789d, 0x662f, 0x6318, 0x6c41, 0x6976];
+
+const gfMultiply = (x, y) => {
+  let z = 0;
+  for (let i = 7; i >= 0; i--) {
+    z = (z << 1) ^ ((z >> 7) * 0x11d);
+    z ^= ((y >> i) & 1) * x;
+  }
+  return z;
+};
+
+const computeReedSolomonEC = (dataBytes, ecCount) => {
+  let gen = [1];
+  let root = 1;
+  for (let i = 0; i < ecCount; i++) {
+    const nextGen = new Array(gen.length + 1).fill(0);
+    for (let j = 0; j < gen.length; j++) {
+      nextGen[j] ^= gen[j];
+      nextGen[j + 1] ^= gfMultiply(gen[j], root);
+    }
+    gen = nextGen;
+    root = gfMultiply(root, 2);
+  }
+
+  const remainder = new Array(ecCount).fill(0);
+  for (let i = 0; i < dataBytes.length; i++) {
+    const factor = dataBytes[i] ^ remainder.shift();
+    remainder.push(0);
+    for (let j = 0; j < ecCount; j++) {
+      remainder[j] ^= gfMultiply(gen[j + 1], factor);
+    }
+  }
+  return remainder;
+};
+
+const generateQrMatrix = (text) => {
+  const bytes = new TextEncoder().encode(text);
+  let version = 1;
+  while (version <= 10) {
+    const countBits = version <= 9 ? 8 : 16;
+    const capacityBits = QR_VERSION_SPECS[version].totalData * 8;
+    if (4 + countBits + bytes.length * 8 <= capacityBits) break;
+    version++;
+  }
+  if (version > 10) return null;
+
+  const spec = QR_VERSION_SPECS[version];
+  const N = spec.size;
+  const countBits = version <= 9 ? 8 : 16;
+
+  // Build data bit stream (Byte mode 0100)
+  const bits = [];
+  const pushBits = (val, len) => {
+    for (let i = len - 1; i >= 0; i--) {
+      bits.push((val >> i) & 1);
+    }
+  };
+  pushBits(0b0100, 4);
+  pushBits(bytes.length, countBits);
+  bytes.forEach((b) => pushBits(b, 8));
+
+  const maxDataBits = spec.totalData * 8;
+  const terminatorLen = Math.min(4, maxDataBits - bits.length);
+  pushBits(0, terminatorLen);
+  while (bits.length % 8 !== 0) bits.push(0);
+
+  const dataCodewords = [];
+  for (let i = 0; i < bits.length; i += 8) {
+    let byte = 0;
+    for (let j = 0; j < 8; j++) byte = (byte << 1) | bits[i + j];
+    dataCodewords.push(byte);
+  }
+  let padToggle = true;
+  while (dataCodewords.length < spec.totalData) {
+    dataCodewords.push(padToggle ? 0xec : 0x11);
+    padToggle = !padToggle;
+  }
+
+  // Split into RS blocks & compute EC codewords
+  const dataBlocks = [];
+  const ecBlocks = [];
+  let offset = 0;
+  for (const [blockDataLen, blockEcLen] of spec.blocks) {
+    const blockData = dataCodewords.slice(offset, offset + blockDataLen);
+    offset += blockDataLen;
+    dataBlocks.push(blockData);
+    ecBlocks.push(computeReedSolomonEC(blockData, blockEcLen));
+  }
+
+  // Interleave data & EC codewords
+  const finalCodewords = [];
+  const maxBlockData = Math.max(...dataBlocks.map((b) => b.length));
+  for (let i = 0; i < maxBlockData; i++) {
+    for (const blk of dataBlocks) {
+      if (i < blk.length) finalCodewords.push(blk[i]);
+    }
+  }
+  const maxBlockEc = Math.max(...ecBlocks.map((b) => b.length));
+  for (let i = 0; i < maxBlockEc; i++) {
+    for (const blk of ecBlocks) {
+      if (i < blk.length) finalCodewords.push(blk[i]);
+    }
+  }
+
+  const allBits = [];
+  for (const cw of finalCodewords) {
+    for (let i = 7; i >= 0; i--) allBits.push((cw >> i) & 1);
+  }
+
+  // Initialize module grid
+  const modules = Array.from({ length: N }, () => new Array(N).fill(false));
+  const isFunction = Array.from({ length: N }, () => new Array(N).fill(false));
+  const setFunc = (r, c, dark) => {
+    if (r >= 0 && r < N && c >= 0 && c < N) {
+      modules[r][c] = dark;
+      isFunction[r][c] = true;
+    }
+  };
+
+  // Finder patterns + separators
+  const drawFinder = (cr, cc) => {
+    for (let dy = -4; dy <= 4; dy++) {
+      for (let dx = -4; dx <= 4; dx++) {
+        const dist = Math.max(Math.abs(dx), Math.abs(dy));
+        setFunc(cr + dy, cc + dx, dist !== 2 && dist !== 4);
+      }
+    }
+  };
+  drawFinder(3, 3);
+  drawFinder(3, N - 4);
+  drawFinder(N - 4, 3);
+
+  // Alignment patterns
+  for (const cy of spec.align) {
+    for (const cx of spec.align) {
+      if (
+        (cy === 6 && cx === 6) ||
+        (cy === 6 && cx === N - 7) ||
+        (cy === N - 7 && cx === 6)
+      ) {
+        continue;
+      }
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          const dist = Math.max(Math.abs(dx), Math.abs(dy));
+          setFunc(cy + dy, cx + dx, dist !== 1);
+        }
+      }
+    }
+  }
+
+  // Timing patterns
+  for (let i = 8; i <= N - 9; i++) {
+    setFunc(6, i, i % 2 === 0);
+    setFunc(i, 6, i % 2 === 0);
+  }
+
+  // Dark module & reserve format info
+  setFunc(N - 8, 8, true);
+  for (let i = 0; i <= 8; i++) {
+    isFunction[8][i] = true;
+    isFunction[i][8] = true;
+  }
+  for (let i = 0; i < 8; i++) isFunction[8][N - 8 + i] = true;
+  for (let i = 0; i < 7; i++) isFunction[N - 7 + i][8] = true;
+
+  // Version info bits (V7+)
+  if (spec.verBits) {
+    for (let i = 0; i < 18; i++) {
+      const bit = Boolean((spec.verBits >> i) & 1);
+      const r = Math.floor(i / 3);
+      const c = N - 11 + (i % 3);
+      setFunc(r, c, bit);
+      setFunc(c, r, bit);
+    }
+  }
+
+  // Place data bits in zig-zag pattern
+  let bitIdx = 0;
+  let upward = true;
+  for (let right = N - 1; right >= 1; right -= 2) {
+    if (right === 6) right = 5;
+    for (let vert = 0; vert < N; vert++) {
+      const r = upward ? N - 1 - vert : vert;
+      for (let j = 0; j < 2; j++) {
+        const c = right - j;
+        if (!isFunction[r][c]) {
+          modules[r][c] = bitIdx < allBits.length ? Boolean(allBits[bitIdx]) : false;
+          bitIdx++;
+        }
+      }
+    }
+    upward = !upward;
+  }
+
+  // Evaluate mask patterns 0..7 & select optimal mask
+  const applyMaskAndFormat = (grid, maskId) => {
+    for (let r = 0; r < N; r++) {
+      for (let c = 0; c < N; c++) {
+        if (isFunction[r][c]) continue;
+        let invert = false;
+        switch (maskId) {
+          case 0:
+            invert = (r + c) % 2 === 0;
+            break;
+          case 1:
+            invert = r % 2 === 0;
+            break;
+          case 2:
+            invert = c % 3 === 0;
+            break;
+          case 3:
+            invert = (r + c) % 3 === 0;
+            break;
+          case 4:
+            invert = (Math.floor(r / 2) + Math.floor(c / 3)) % 2 === 0;
+            break;
+          case 5:
+            invert = ((r * c) % 2) + ((r * c) % 3) === 0;
+            break;
+          case 6:
+            invert = (((r * c) % 2) + ((r * c) % 3)) % 2 === 0;
+            break;
+          case 7:
+            invert = (((r + c) % 2) + ((r * c) % 3)) % 2 === 0;
+            break;
+          default:
+            break;
+        }
+        if (invert) grid[r][c] = !grid[r][c];
+      }
+    }
+    const fmt = QR_FORMAT_BITS_L[maskId];
+    for (let i = 0; i <= 5; i++) grid[8][i] = Boolean((fmt >> i) & 1);
+    grid[8][7] = Boolean((fmt >> 6) & 1);
+    grid[8][8] = Boolean((fmt >> 7) & 1);
+    grid[7][8] = Boolean((fmt >> 8) & 1);
+    for (let i = 9; i <= 14; i++) grid[14 - i][8] = Boolean((fmt >> i) & 1);
+
+    for (let i = 0; i <= 6; i++) grid[N - 1 - i][8] = Boolean((fmt >> i) & 1);
+    for (let i = 7; i <= 14; i++) grid[8][N - 15 + i] = Boolean((fmt >> i) & 1);
+  };
+
+  let bestMask = 0;
+  let bestScore = Infinity;
+  let bestGrid = null;
+
+  for (let m = 0; m < 8; m++) {
+    const candidate = modules.map((row) => [...row]);
+    applyMaskAndFormat(candidate, m);
+
+    // Penalty scoring (N1 adjacent runs + N2 2x2 blocks + N4 dark balance)
+    let score = 0;
+    for (let r = 0; r < N; r++) {
+      let runLen = 1;
+      for (let c = 1; c < N; c++) {
+        if (candidate[r][c] === candidate[r][c - 1]) {
+          runLen++;
+          if (runLen === 5) score += 3;
+          else if (runLen > 5) score += 1;
+        } else {
+          runLen = 1;
+        }
+      }
+    }
+    for (let c = 0; c < N; c++) {
+      let runLen = 1;
+      for (let r = 1; r < N; r++) {
+        if (candidate[r][c] === candidate[r - 1][c]) {
+          runLen++;
+          if (runLen === 5) score += 3;
+          else if (runLen > 5) score += 1;
+        } else {
+          runLen = 1;
+        }
+      }
+    }
+    let darkCount = 0;
+    for (let r = 0; r < N; r++) {
+      for (let c = 0; c < N; c++) {
+        if (candidate[r][c]) darkCount++;
+        if (
+          r < N - 1 &&
+          c < N - 1 &&
+          candidate[r][c] === candidate[r][c + 1] &&
+          candidate[r][c] === candidate[r + 1][c] &&
+          candidate[r][c] === candidate[r + 1][c + 1]
+        ) {
+          score += 3;
+        }
+      }
+    }
+    const darkRatio = (darkCount * 100) / (N * N);
+    score += Math.floor(Math.abs(darkRatio - 50) / 5) * 10;
+
+    if (score < bestScore) {
+      bestScore = score;
+      bestMask = m;
+      bestGrid = candidate;
+    }
+  }
+
+  return bestGrid;
+};
+
+// Reusable SVG QR Code Renderer Component
+const QrCodeSvg = ({ value, size = 210 }) => {
+  const matrix = useMemo(() => generateQrMatrix(value), [value]);
+  if (!matrix) return null;
+  const n = matrix.length;
+  const quietZone = 4;
+  const total = n + quietZone * 2;
+
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox={`0 0 ${total} ${total}`}
+      shapeRendering="crispEdges"
+      className="rounded-xl bg-white p-2 border border-slate-200 shadow-sm mx-auto"
+    >
+      <rect x="0" y="0" width={total} height={total} fill="#FFFFFF" />
+      {matrix.map((row, r) =>
+        row.map((isDark, c) =>
+          isDark ? (
+            <rect
+              key={`${r}-${c}`}
+              x={c + quietZone}
+              y={r + quietZone}
+              width="1"
+              height="1"
+              fill="#0F172A"
+            />
+          ) : null
+        )
+      )}
+    </svg>
+  );
+};
+
 export default function App() {
-  const APP_VERSION = 'V3.2.0 PRO';
+  const APP_VERSION = 'V4.0.0 PRO';
 
   // Load initial state once from localStorage (defaults to clean empty state)
   const savedState = useMemo(() => loadSavedState(), []);
@@ -159,13 +584,21 @@ export default function App() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [activeView, setActiveView] = useState('tracker'); // 'tracker' | 'dashboard' | 'dispenser_history' | 'history' | 'settings'
 
-  // Core Hierarchical Data State (Starts completely empty unless saved in localStorage)
+  // Core Hierarchical Data State
   const [areas, setAreas] = useState(() => (Array.isArray(savedState?.areas) ? savedState.areas : []));
   const [lastGlobalUpdateDate, setLastGlobalUpdateDate] = useState(
     () => savedState?.lastGlobalUpdateDate || ''
   );
   const [actionHistory, setActionHistory] = useState(() =>
     Array.isArray(savedState?.actionHistory) ? savedState.actionHistory : []
+  );
+
+  // Persistent Quick-Pick Name History for Technicians & Escorts
+  const [savedTechnicians, setSavedTechnicians] = useState(() =>
+    Array.isArray(savedState?.savedTechnicians) ? savedState.savedTechnicians : []
+  );
+  const [savedEscorts, setSavedEscorts] = useState(() =>
+    Array.isArray(savedState?.savedEscorts) ? savedState.savedEscorts : []
   );
 
   // Active Selection States
@@ -195,7 +628,24 @@ export default function App() {
   const [resetFiltersOnRenewal, setResetFiltersOnRenewal] = useState(true);
   const [renewalError, setRenewalError] = useState('');
 
-  // Custom Confirmation Modal State (Never uses native alert/confirm)
+  // Action Center Collapse State
+  const [actionCenterExpanded, setActionCenterExpanded] = useState(true);
+
+  // QR Label Modal State
+  const [showQrModal, setShowQrModal] = useState(false);
+
+  // Official A4 / PDF Inspection Report Modal State
+  const [showReportModal, setShowReportModal] = useState(false);
+  const [reportInspectorName, setReportInspectorName] = useState('');
+
+  // Photo Capture & Lightbox States
+  const [photoCategory, setPhotoCategory] = useState('תג שמיש מתקן');
+  const [isCompressingPhoto, setIsCompressingPhoto] = useState(false);
+  const [lightboxPhoto, setLightboxPhoto] = useState(null);
+  const cameraInputRef = useRef(null);
+  const galleryInputRef = useRef(null);
+
+  // Custom Confirmation Modal State
   const [confirmModal, setConfirmModal] = useState({
     isOpen: false,
     type: null, // 'area' | 'location' | 'reset_all'
@@ -204,9 +654,12 @@ export default function App() {
     message: ''
   });
 
-  // Dashboard Filter States
+  // Dashboard Filter & Sort States
   const [trackingPeriod, setTrackingPeriod] = useState('6m'); // '6m' | '1y'
   const [dashboardSearch, setDashboardSearch] = useState('');
+  const [dashboardStatusFilter, setDashboardStatusFilter] = useState('all'); // 'all' | 'faulty' | 'expired'
+  const [dashboardAreaFilter, setDashboardAreaFilter] = useState('all');
+  const [dashboardSortBy, setDashboardSortBy] = useState('default'); // 'default' | 'lowest_filter' | 'nearest_expiry'
 
   // Excel Backup Import/Export States & Refs
   const [isBackupBusy, setIsBackupBusy] = useState(false);
@@ -219,7 +672,7 @@ export default function App() {
   // Ref to coalesce rapid slider/typing audit logs for the same location & field
   const lastLogMetaRef = useRef({ key: '', timestamp: 0 });
 
-  // Sync `.dark` class on <html> so all Tailwind `dark:` variants & native controls match theme
+  // Sync `.dark` class on <html>
   useEffect(() => {
     const root = document.documentElement;
     if (darkMode) {
@@ -239,6 +692,8 @@ export default function App() {
         areas,
         lastGlobalUpdateDate,
         actionHistory,
+        savedTechnicians,
+        savedEscorts,
         selectedAreaId,
         selectedLocationId
       };
@@ -246,7 +701,16 @@ export default function App() {
     } catch {
       // Ignore storage quota or private-browsing errors gracefully
     }
-  }, [darkMode, areas, lastGlobalUpdateDate, actionHistory, selectedAreaId, selectedLocationId]);
+  }, [
+    darkMode,
+    areas,
+    lastGlobalUpdateDate,
+    actionHistory,
+    savedTechnicians,
+    savedEscorts,
+    selectedAreaId,
+    selectedLocationId
+  ]);
 
   // Clean up toast timer on unmount
   useEffect(() => {
@@ -254,6 +718,62 @@ export default function App() {
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     };
   }, []);
+
+  // QR Code Deep-Linking Handler: Automatically open specific Area & Dispenser when scanned via URL query
+  useEffect(() => {
+    const handleQrUrlNavigation = () => {
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const qrAreaParam = params.get('area');
+        const qrLocParam = params.get('loc');
+        if (!qrAreaParam && !qrLocParam) return;
+        if (areas.length === 0) return;
+
+        let matchedArea = areas.find(
+          (a) =>
+            String(a.id) === qrAreaParam ||
+            a.name.trim().toLowerCase() === String(qrAreaParam || '').trim().toLowerCase()
+        );
+        let matchedLoc = matchedArea?.locations.find(
+          (l) =>
+            String(l.id) === qrLocParam ||
+            l.name.trim().toLowerCase() === String(qrLocParam || '').trim().toLowerCase()
+        );
+
+        // Fallback: search by loc across all areas if area wasn't matched
+        if (!matchedLoc && qrLocParam) {
+          for (const a of areas) {
+            const found = a.locations.find((l) => String(l.id) === qrLocParam);
+            if (found) {
+              matchedArea = a;
+              matchedLoc = found;
+              break;
+            }
+          }
+        }
+
+        if (matchedArea) {
+          setSelectedAreaId(matchedArea.id);
+          if (matchedLoc) {
+            setSelectedLocationId(matchedLoc.id);
+          }
+          setActiveView('tracker');
+          notify(
+            `נפתח מתקן מסריקת QR: ${matchedLoc ? matchedLoc.dispenserName : matchedArea.name}`,
+            4200
+          );
+        }
+
+        // Clean query string cleanly so subsequent refreshes behave normally
+        const cleanUrl = `${window.location.origin}${window.location.pathname}`;
+        window.history.replaceState({}, document.title, cleanUrl);
+      } catch {
+        // Ignore URL parsing errors
+      }
+    };
+
+    handleQrUrlNavigation();
+  }, [areas]);
 
   // Keep active selection valid when items are added or deleted
   useEffect(() => {
@@ -342,7 +862,6 @@ export default function App() {
     const targetMonthIndex = baseDate.getMonth() + months;
     const dueDate = new Date(baseDate.getFullYear(), targetMonthIndex, baseDate.getDate());
 
-    // Handle month-end overflow (e.g. Aug 31 + 6 months -> Feb 28/29 instead of Mar 3)
     const expectedMonth = ((targetMonthIndex % 12) + 12) % 12;
     if (dueDate.getMonth() !== expectedMonth) {
       dueDate.setDate(0);
@@ -402,7 +921,7 @@ export default function App() {
     [currentArea, selectedLocationId]
   );
 
-  // Flattened inventory across all areas for Dashboard
+  // Flattened inventory across all areas
   const allDispensers = useMemo(() => {
     return areas.flatMap((area) =>
       area.locations.map((loc) => ({
@@ -413,36 +932,458 @@ export default function App() {
     );
   }, [areas]);
 
-  const filteredDispensers = useMemo(() => {
-    if (!dashboardSearch.trim()) return allDispensers;
-    const q = dashboardSearch.trim().toLowerCase();
-    return allDispensers.filter(
-      (item) =>
-        item.areaName.toLowerCase().includes(q) ||
-        item.name.toLowerCase().includes(q) ||
-        (item.dispenserName || '').toLowerCase().includes(q) ||
-        (item.systemType || '').toLowerCase().includes(q)
-    );
-  }, [allDispensers, dashboardSearch]);
+  // Combined Unique History of Technicians & Escorts (from both persistent list & all renewal records)
+  const technicianHistoryList = useMemo(() => {
+    const set = new Set(savedTechnicians.map((n) => n.trim()).filter(Boolean));
+    allDispensers.forEach((d) => {
+      (d.filterRefreshHistory || []).forEach((rec) => {
+        if (rec.technician?.trim()) set.add(rec.technician.trim());
+      });
+    });
+    return Array.from(set);
+  }, [savedTechnicians, allDispensers]);
 
-  // Top-left live Table Update Date (synced with selected dispenser or global latest update)
+  const escortHistoryList = useMemo(() => {
+    const set = new Set(savedEscorts.map((n) => n.trim()).filter(Boolean));
+    allDispensers.forEach((d) => {
+      (d.filterRefreshHistory || []).forEach((rec) => {
+        if (rec.escort?.trim()) set.add(rec.escort.trim());
+      });
+    });
+    return Array.from(set);
+  }, [savedEscorts, allDispensers]);
+
+  // =========================================================================
+  // SMART URGENT ACTION CENTER (מרכז התראות ודברים דחופים)
+  // =========================================================================
+  const urgentAlerts = useMemo(() => {
+    const alerts = [];
+    const seenKeys = new Set();
+
+    const pushUniqueAlert = (alertObj) => {
+      const dedupeKey = `${alertObj.locationId}|${alertObj.message}`;
+      if (seenKeys.has(dedupeKey)) return;
+      seenKeys.add(dedupeKey);
+      alerts.push(alertObj);
+    };
+
+    allDispensers.forEach((item) => {
+      const diffDisp = item.tagExpiry ? getDaysUntilDate(item.tagExpiry) : null;
+      const diffTank = item.tankTagExpiry ? getDaysUntilDate(item.tankTagExpiry) : null;
+      const dispNeedsAlert = diffDisp !== null && diffDisp <= 30;
+      const tankNeedsAlert = diffTank !== null && diffTank <= 30;
+
+      // 1 & 2. Dispenser & Tank Tag Expiry (combined when both have the exact same expiry date)
+      if (dispNeedsAlert && tankNeedsAlert && item.tagExpiry === item.tankTagExpiry) {
+        if (diffDisp < 0) {
+          pushUniqueAlert({
+            id: `${item.id}-both-tags-exp`,
+            areaId: item.areaId,
+            areaName: item.areaName,
+            locationId: item.id,
+            locationName: item.name,
+            dispenserName: item.dispenserName,
+            category: 'tag',
+            severity: 'critical',
+            message: `פג תוקף תג שמיש למתקן ולמיכל (${formatDateIL(item.tagExpiry)} • לפני ${Math.abs(diffDisp)} ימים)`
+          });
+        } else {
+          pushUniqueAlert({
+            id: `${item.id}-both-tags-soon`,
+            areaId: item.areaId,
+            areaName: item.areaName,
+            locationId: item.id,
+            locationName: item.name,
+            dispenserName: item.dispenserName,
+            category: 'tag',
+            severity: 'warning',
+            message:
+              diffDisp === 0
+                ? `תוקף תג שמיש למתקן ולמיכל פג היום (${formatDateIL(item.tagExpiry)})`
+                : `תוקף תג שמיש למתקן ולמיכל עומד לפוג בעוד ${diffDisp} ימים (${formatDateIL(item.tagExpiry)})`
+          });
+        }
+      } else {
+        if (dispNeedsAlert) {
+          if (diffDisp < 0) {
+            pushUniqueAlert({
+              id: `${item.id}-disp-tag-exp`,
+              areaId: item.areaId,
+              areaName: item.areaName,
+              locationId: item.id,
+              locationName: item.name,
+              dispenserName: item.dispenserName,
+              category: 'tag',
+              severity: 'critical',
+              message: `[מתקן] פג תוקף תג שמיש (${formatDateIL(item.tagExpiry)} • לפני ${Math.abs(diffDisp)} ימים)`
+            });
+          } else {
+            pushUniqueAlert({
+              id: `${item.id}-disp-tag-soon`,
+              areaId: item.areaId,
+              areaName: item.areaName,
+              locationId: item.id,
+              locationName: item.name,
+              dispenserName: item.dispenserName,
+              category: 'tag',
+              severity: 'warning',
+              message:
+                diffDisp === 0
+                  ? `[מתקן] תוקף תג שמיש פג היום (${formatDateIL(item.tagExpiry)})`
+                  : `[מתקן] תוקף תג שמיש עומד לפוג בעוד ${diffDisp} ימים (${formatDateIL(item.tagExpiry)})`
+            });
+          }
+        }
+
+        if (tankNeedsAlert) {
+          if (diffTank < 0) {
+            pushUniqueAlert({
+              id: `${item.id}-tank-tag-exp`,
+              areaId: item.areaId,
+              areaName: item.areaName,
+              locationId: item.id,
+              locationName: item.name,
+              dispenserName: item.dispenserName,
+              category: 'tag',
+              severity: 'critical',
+              message: `[מיכל] פג תוקף תג שמיש (${formatDateIL(item.tankTagExpiry)} • לפני ${Math.abs(diffTank)} ימים)`
+            });
+          } else {
+            pushUniqueAlert({
+              id: `${item.id}-tank-tag-soon`,
+              areaId: item.areaId,
+              areaName: item.areaName,
+              locationId: item.id,
+              locationName: item.name,
+              dispenserName: item.dispenserName,
+              category: 'tag',
+              severity: 'warning',
+              message:
+                diffTank === 0
+                  ? `[מיכל] תוקף תג שמיש פג היום (${formatDateIL(item.tankTagExpiry)})`
+                  : `[מיכל] תוקף תג שמיש עומד לפוג בעוד ${diffTank} ימים (${formatDateIL(item.tankTagExpiry)})`
+            });
+          }
+        }
+      }
+
+      // 3. Filter Alef 1 or Filter Alef 2 below 20%
+      if (Number(item.filterAlef1) < 20) {
+        pushUniqueAlert({
+          id: `${item.id}-alef1-low`,
+          areaId: item.areaId,
+          areaName: item.areaName,
+          locationId: item.id,
+          locationName: item.name,
+          dispenserName: item.dispenserName,
+          category: 'filter_low',
+          severity: Number(item.filterAlef1) <= 10 ? 'critical' : 'warning',
+          message: `פילטר אלף 1 ירד ל-${item.filterAlef1}% (מתחת ל-20%)`
+        });
+      }
+      if (Number(item.filterAlef2) < 20) {
+        pushUniqueAlert({
+          id: `${item.id}-alef2-low`,
+          areaId: item.areaId,
+          areaName: item.areaName,
+          locationId: item.id,
+          locationName: item.name,
+          dispenserName: item.dispenserName,
+          category: 'filter_low',
+          severity: Number(item.filterAlef2) <= 10 ? 'critical' : 'warning',
+          message: `פילטר אלף 2 ירד ל-${item.filterAlef2}% (מתחת ל-20%)`
+        });
+      }
+
+      // 4. Filter Maga or Tank Sensitivity marked as 'לא תקין'
+      if (item.filterMaga === 'לא תקין') {
+        pushUniqueAlert({
+          id: `${item.id}-maga-fault`,
+          areaId: item.areaId,
+          areaName: item.areaName,
+          locationId: item.id,
+          locationName: item.name,
+          dispenserName: item.dispenserName,
+          category: 'fault',
+          severity: 'critical',
+          message: 'פילטר מגה מסומן כ"לא תקין"'
+        });
+      }
+      if (item.tankSensitivity === 'לא תקין') {
+        pushUniqueAlert({
+          id: `${item.id}-tank-fault`,
+          areaId: item.areaId,
+          areaName: item.areaName,
+          locationId: item.id,
+          locationName: item.name,
+          dispenserName: item.dispenserName,
+          category: 'fault',
+          severity: 'critical',
+          message: 'רגישות מיכל מסומנת כ"לא תקין"'
+        });
+      }
+    });
+
+    // Sort critical alerts first, then warnings
+    return alerts.sort((a, b) => {
+      if (a.severity === b.severity) return 0;
+      return a.severity === 'critical' ? -1 : 1;
+    });
+  }, [allDispensers]);
+
+  // Helper: Check if a dispenser has any tag expired or expiring within 30 days
+  const hasExpiredOrExpiringTag = (item) => {
+    const d1 = getDaysUntilDate(item.tagExpiry);
+    const d2 = getDaysUntilDate(item.tankTagExpiry);
+    return (d1 !== null && d1 <= 30) || (d2 !== null && d2 <= 30);
+  };
+
+  // Helper: Overall location health indicator
+  const isLocationHealthy = (loc) =>
+    loc.filterMaga === 'תקין' &&
+    loc.tankSensitivity === 'תקין' &&
+    Number(loc.filterAlef1) >= 20 &&
+    Number(loc.filterAlef2) >= 20;
+
+  // Advanced Filtered & Sorted Dispensers for Dashboard
+  const filteredDispensers = useMemo(() => {
+    let list = [...allDispensers];
+
+    // 1. Area filter
+    if (dashboardAreaFilter !== 'all') {
+      list = list.filter((item) => item.areaId === dashboardAreaFilter);
+    }
+
+    // 2. Status quick filter ('all' | 'faulty' | 'expired')
+    if (dashboardStatusFilter === 'faulty') {
+      list = list.filter((item) => !isLocationHealthy(item));
+    } else if (dashboardStatusFilter === 'expired') {
+      list = list.filter((item) => hasExpiredOrExpiringTag(item));
+    }
+
+    // 3. Text search
+    if (dashboardSearch.trim()) {
+      const q = dashboardSearch.trim().toLowerCase();
+      list = list.filter(
+        (item) =>
+          item.areaName.toLowerCase().includes(q) ||
+          item.name.toLowerCase().includes(q) ||
+          (item.dispenserName || '').toLowerCase().includes(q) ||
+          (item.systemType || '').toLowerCase().includes(q) ||
+          (item.notes || '').toLowerCase().includes(q)
+      );
+    }
+
+    // 4. Sorting ('default' | 'lowest_filter' | 'nearest_expiry')
+    if (dashboardSortBy === 'lowest_filter') {
+      list.sort((a, b) => {
+        const minA = Math.min(Number(a.filterAlef1 ?? 100), Number(a.filterAlef2 ?? 100));
+        const minB = Math.min(Number(b.filterAlef1 ?? 100), Number(b.filterAlef2 ?? 100));
+        return minA - minB;
+      });
+    } else if (dashboardSortBy === 'nearest_expiry') {
+      list.sort((a, b) => {
+        const getNearest = (it) => {
+          const d1 = getDaysUntilDate(it.tagExpiry);
+          const d2 = getDaysUntilDate(it.tankTagExpiry);
+          const vals = [d1, d2].filter((v) => v !== null);
+          return vals.length > 0 ? Math.min(...vals) : 999999;
+        };
+        return getNearest(a) - getNearest(b);
+      });
+    }
+
+    return list;
+  }, [
+    allDispensers,
+    dashboardAreaFilter,
+    dashboardStatusFilter,
+    dashboardSearch,
+    dashboardSortBy
+  ]);
+
+  // Top-left live Table Update Date
   const headerTableUpdateDate = currentLocation?.lastTableUpdateDate || lastGlobalUpdateDate;
   const todayLocalIso = getLocalIsoDate();
+
+  // QR Deep Link URL for current dispenser
+  const currentDispenserQrUrl = useMemo(() => {
+    if (!currentArea || !currentLocation || typeof window === 'undefined') return '';
+    const baseUrl = `${window.location.origin}${window.location.pathname}`;
+    return `${baseUrl}?area=${encodeURIComponent(currentArea.id)}&loc=${encodeURIComponent(
+      currentLocation.id
+    )}`;
+  }, [currentArea, currentLocation]);
+
+  // =========================================================================
+  // MOBILE CAMERA & GALLERY PHOTO DOCUMENTATION HANDLERS
+  // =========================================================================
+  const handlePhotoFileSelected = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file || !selectedAreaId || !selectedLocationId || !currentLocation) return;
+
+    setIsCompressingPhoto(true);
+    try {
+      const compressedDataUrl = await compressImageFile(file, 800, 0.66);
+      const { todayStr, fullDateTime } = getNowStrings();
+      const newPhoto = {
+        id: `photo-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        dataUrl: compressedDataUrl,
+        category: photoCategory,
+        date: fullDateTime,
+        isoDate: todayStr
+      };
+
+      setAreas((prev) =>
+        prev.map((area) => {
+          if (area.id !== selectedAreaId) return area;
+          return {
+            ...area,
+            locations: area.locations.map((loc) =>
+              loc.id === selectedLocationId
+                ? {
+                    ...loc,
+                    photos: [newPhoto, ...(loc.photos || [])],
+                    lastTableUpdateDate: todayStr
+                  }
+                : loc
+            )
+          };
+        })
+      );
+
+      setLastGlobalUpdateDate(todayStr);
+      setActionHistory((prev) => [
+        {
+          id: Date.now() + Math.random(),
+          date: fullDateTime,
+          user: 'מפעיל מערכת',
+          description: `אזור "${currentArea?.name}" > מקום "${currentLocation.name}" > מתקן "${currentLocation.dispenserName}": נוספה תמונת תיעוד (${photoCategory})`
+        },
+        ...prev
+      ]);
+      notify(`התמונה נשמרה וכווצה בהצלחה (${photoCategory})`);
+    } catch {
+      notify('שגיאה בעיבוד התמונה. נסה לצלם או לבחור תמונה אחרת.');
+    } finally {
+      setIsCompressingPhoto(false);
+      if (cameraInputRef.current) cameraInputRef.current.value = '';
+      if (galleryInputRef.current) galleryInputRef.current.value = '';
+    }
+  };
+
+  const handleDeletePhoto = (photoId) => {
+    if (!selectedAreaId || !selectedLocationId || !currentLocation) return;
+    const { todayStr, fullDateTime } = getNowStrings();
+
+    setAreas((prev) =>
+      prev.map((area) => {
+        if (area.id !== selectedAreaId) return area;
+        return {
+          ...area,
+          locations: area.locations.map((loc) =>
+            loc.id === selectedLocationId
+              ? {
+                  ...loc,
+                  photos: (loc.photos || []).filter((p) => p.id !== photoId),
+                  lastTableUpdateDate: todayStr
+                }
+              : loc
+          )
+        };
+      })
+    );
+
+    if (lightboxPhoto?.id === photoId) setLightboxPhoto(null);
+    setActionHistory((prev) => [
+      {
+        id: Date.now() + Math.random(),
+        date: fullDateTime,
+        user: 'מפעיל מערכת',
+        description: `נמחקה תמונת תיעוד ממתקן "${currentLocation.dispenserName}"`
+      },
+      ...prev
+    ]);
+    notify('התמונה נמחקה');
+  };
+
+  // Download QR Code + Dispenser Label as high-res PNG image
+  const handleDownloadQrPng = () => {
+    if (!currentLocation || !currentArea || !currentDispenserQrUrl) return;
+    const matrix = generateQrMatrix(currentDispenserQrUrl);
+    if (!matrix) return;
+
+    const n = matrix.length;
+    const scale = 10;
+    const quiet = 4;
+    const qrPixelSize = (n + quiet * 2) * scale;
+    const footerHeight = 96;
+    const canvas = document.createElement('canvas');
+    canvas.width = qrPixelSize;
+    canvas.height = qrPixelSize + footerHeight;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // White background
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Draw QR modules
+    ctx.fillStyle = '#0F172A';
+    for (let r = 0; r < n; r++) {
+      for (let c = 0; c < n; c++) {
+        if (matrix[r][c]) {
+          ctx.fillRect((c + quiet) * scale, (r + quiet) * scale, scale, scale);
+        }
+      }
+    }
+
+    // Divider line
+    ctx.strokeStyle = '#E2E8F0';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(20, qrPixelSize + 6);
+    ctx.lineTo(canvas.width - 20, qrPixelSize + 6);
+    ctx.stroke();
+
+    // Hebrew Label Footer
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#0F172A';
+    ctx.font = 'bold 18px sans-serif';
+    ctx.fillText(currentLocation.dispenserName, canvas.width / 2, qrPixelSize + 34);
+
+    ctx.fillStyle = '#475569';
+    ctx.font = '14px sans-serif';
+    ctx.fillText(
+      `אזור: ${currentArea.name} | מקום: ${currentLocation.name}`,
+      canvas.width / 2,
+      qrPixelSize + 58
+    );
+
+    ctx.fillStyle = '#4F46E5';
+    ctx.font = 'bold 11px sans-serif';
+    ctx.fillText('AquaOps PRO • סרוק לפתיחת כרטיס מתקן', canvas.width / 2, qrPixelSize + 80);
+
+    const url = canvas.toDataURL('image/png');
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `QR_${currentArea.name}_${currentLocation.dispenserName}.png`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    notify('תווית ה-QR הורדה כתמונה (PNG)!');
+  };
 
   // =========================================================================
   // EXCEL BACKUP EXPORT & NON-DESTRUCTIVE DEDUPLICATED IMPORT
   // =========================================================================
-
-  /**
-   * Build structured rows for the 3 backup sheets (Dispensers, Renewals, Action Log)
-   */
   const buildBackupDatasets = () => {
     const dispensersRows = [];
     const renewalsRows = [];
 
     areas.forEach((area) => {
       if (!area.locations || area.locations.length === 0) {
-        // Preserve empty areas in the backup workbook as well
         dispensersRows.push({
           מזהה_אזור: area.id,
           שם_אזור: area.name,
@@ -460,6 +1401,7 @@ export default function App() {
           רגישות_מיכל: '',
           עגלה_למיכל: '',
           תוקף_תג_מיכל: '',
+          מספר_תמונות: 0,
           הערות: ''
         });
         return;
@@ -483,6 +1425,7 @@ export default function App() {
           רגישות_מיכל: loc.tankSensitivity || 'תקין',
           עגלה_למיכל: loc.cartridgeCarriage || 'יש עגלה',
           תוקף_תג_מיכל: loc.tankTagExpiry || '',
+          מספר_תמונות: (loc.photos || []).length,
           הערות: loc.notes || ''
         });
 
@@ -514,9 +1457,6 @@ export default function App() {
     return { dispensersRows, renewalsRows, historyRows };
   };
 
-  /**
-   * Export entire system data to an Excel (.xlsx) workbook with RTL sheets
-   */
   const handleExportExcelBackup = async () => {
     if (areas.length === 0 && actionHistory.length === 0) {
       notify('אין נתונים במערכת לייצוא כרגע');
@@ -544,6 +1484,7 @@ export default function App() {
       'רגישות_מיכל',
       'עגלה_למיכל',
       'תוקף_תג_מיכל',
+      'מספר_תמונות',
       'הערות'
     ];
     const renewalHeaders = [
@@ -591,7 +1532,6 @@ export default function App() {
       XLSX.writeFile(wb, `AquaOps_Backup_${todayStr}.xlsx`);
       notify('קובץ גיבוי Excel (.xlsx) יוצא בהצלחה!');
     } catch {
-      // Offline fallback: Generate Excel-compatible SpreadsheetML XML (.xls) workbook
       const buildXmlSheet = (sheetName, headers, rows) => {
         const headerCells = headers
           .map((h) => `<Cell><Data ss:Type="String">${escapeXml(h)}</Data></Cell>`)
@@ -646,9 +1586,6 @@ export default function App() {
     }
   };
 
-  /**
-   * Parse SpreadsheetML XML (.xls fallback) into sheet row objects
-   */
   const parseSpreadsheetMLFallback = (xmlText) => {
     const parser = new DOMParser();
     const doc = parser.parseFromString(xmlText, 'application/xml');
@@ -682,22 +1619,17 @@ export default function App() {
     return result;
   };
 
-  /**
-   * Smart Non-Destructive Merge:
-   * - Never overwrites existing areas, locations, or dispenser records.
-   * - Prevents duplicates across areas, locations, filter renewal records, and action logs.
-   */
   const mergeImportedDatasets = ({ dispensersRows, renewalsRows, historyRows }) => {
     let addedAreasCount = 0;
     let addedLocationsCount = 0;
     let addedRenewalsCount = 0;
     let skippedDuplicatesCount = 0;
 
-    // Deep clone current areas so we can merge safely without mutating state directly
     const mergedAreas = areas.map((area) => ({
       ...area,
       locations: area.locations.map((loc) => ({
         ...loc,
+        photos: [...(loc.photos || [])],
         filterRefreshHistory: [...(loc.filterRefreshHistory || [])]
       }))
     }));
@@ -731,7 +1663,6 @@ export default function App() {
       return null;
     };
 
-    // 1. Merge Areas & Locations/Dispensers without overwriting existing entries
     dispensersRows.forEach((row, index) => {
       const rawAreaName = String(row['שם_אזור'] ?? row.areaName ?? '').trim();
       const rawAreaId = String(row['מזהה_אזור'] ?? row.areaId ?? '').trim();
@@ -739,9 +1670,10 @@ export default function App() {
 
       let targetArea = findMatchingArea(rawAreaId, rawAreaName);
       if (!targetArea) {
-        let newAreaId = rawAreaId && !usedAreaIds.has(rawAreaId)
-          ? rawAreaId
-          : `area-imp-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 6)}`;
+        let newAreaId =
+          rawAreaId && !usedAreaIds.has(rawAreaId)
+            ? rawAreaId
+            : `area-imp-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 6)}`;
         usedAreaIds.add(newAreaId);
         targetArea = {
           id: newAreaId,
@@ -754,18 +1686,18 @@ export default function App() {
 
       const rawLocName = String(row['שם_מקום'] ?? row.name ?? '').trim();
       const rawLocId = String(row['מזהה_מקום'] ?? row.id ?? '').trim();
-      if (!rawLocName) return; // Empty area row without locations
+      if (!rawLocName) return;
 
       const existingLoc = findMatchingLocation(targetArea, rawLocId, rawLocName);
       if (existingLoc) {
-        // Already exists -> Do NOT overwrite existing dispenser data; count as skipped duplicate
         skippedDuplicatesCount += 1;
         return;
       }
 
-      let newLocId = rawLocId && !usedLocationIds.has(rawLocId)
-        ? rawLocId
-        : `loc-imp-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 6)}`;
+      let newLocId =
+        rawLocId && !usedLocationIds.has(rawLocId)
+          ? rawLocId
+          : `loc-imp-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 6)}`;
       usedLocationIds.add(newLocId);
 
       const rawAlef1 = Number(row['פילטר_אלף_1'] ?? row.filterAlef1);
@@ -774,7 +1706,8 @@ export default function App() {
       targetArea.locations.push({
         id: newLocId,
         name: rawLocName,
-        dispenserName: String(row['שם_מתקן'] ?? row.dispenserName ?? rawLocName).trim() || rawLocName,
+        dispenserName:
+          String(row['שם_מתקן'] ?? row.dispenserName ?? rawLocName).trim() || rawLocName,
         filterMaga:
           String(row['פילטר_מגה'] ?? row.filterMaga ?? '').trim() === 'לא תקין'
             ? 'לא תקין'
@@ -807,12 +1740,12 @@ export default function App() {
             : 'יש עגלה',
         tankTagExpiry: normalizeImportedDate(row['תוקף_תג_מיכל'] ?? row.tankTagExpiry),
         notes: String(row['הערות'] ?? row.notes ?? '').trim(),
+        photos: Array.isArray(row.photos) ? row.photos : [],
         filterRefreshHistory: []
       });
       addedLocationsCount += 1;
     });
 
-    // 2. Merge Per-Dispenser Filter Renewal History without duplicates
     renewalsRows.forEach((row, index) => {
       const rawAreaName = String(row['שם_אזור'] ?? row.areaName ?? '').trim();
       const rawAreaId = String(row['מזהה_אזור'] ?? row.areaId ?? '').trim();
@@ -862,13 +1795,11 @@ export default function App() {
       });
       addedRenewalsCount += 1;
 
-      // Keep lastFilterRefreshDate synced with the newest renewal date if newer
       if (isoDate && (!targetLoc.lastFilterRefreshDate || isoDate > targetLoc.lastFilterRefreshDate)) {
         targetLoc.lastFilterRefreshDate = isoDate;
       }
     });
 
-    // Sort renewal histories newest first
     mergedAreas.forEach((area) => {
       area.locations.forEach((loc) => {
         if (loc.filterRefreshHistory.length > 1) {
@@ -879,7 +1810,6 @@ export default function App() {
       });
     });
 
-    // 3. Merge Global Action History without duplicates
     const mergedHistory = [...actionHistory];
     const existingLogSignatures = new Set(
       mergedHistory.map((log) => `${log.date}|${log.description.trim()}`)
@@ -930,9 +1860,6 @@ export default function App() {
     );
   };
 
-  /**
-   * Handle file upload (.xlsx, .xls, .csv) and trigger non-destructive deduplicated import
-   */
   const handleImportExcelFile = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -972,7 +1899,6 @@ export default function App() {
         return;
       }
 
-      // Check if file is SpreadsheetML XML (.xls fallback)
       const headSnippet = await file.slice(0, 200).text();
       if (headSnippet.includes('schemas-microsoft-com:office:spreadsheet')) {
         const fullXml = await file.text();
@@ -985,7 +1911,6 @@ export default function App() {
         return;
       }
 
-      // Standard Excel (.xlsx / .xls / .csv) via SheetJS
       const XLSX = await loadXLSXLibrary();
       const buffer = await file.arrayBuffer();
       const wb = XLSX.read(buffer, { type: 'array', cellDates: true });
@@ -1017,8 +1942,6 @@ export default function App() {
 
   /**
    * Live update for any dispenser / tank / notes field.
-   * Updates `lastTableUpdateDate` on the dispenser and the top-left header indicator.
-   * Coalesces rapid continuous edits (sliders/text typing) into clean audit log entries.
    */
   const handleUpdateField = (field, rawValue) => {
     if (!selectedAreaId || !selectedLocationId || !currentLocation) return;
@@ -1084,9 +2007,7 @@ export default function App() {
   };
 
   /**
-   * Confirm Filter Renewal:
-   * Requires Technician, Escort & Renewal Date, records in the dispenser's own `filterRefreshHistory`,
-   * optionally resets filter health to 100% / תקין, and updates `lastFilterRefreshDate` and `lastTableUpdateDate`.
+   * Confirm Filter Renewal + Save Technician & Escort names to Quick-Pick History
    */
   const handleConfirmFilterRenewal = () => {
     if (!currentLocation || !currentArea) return;
@@ -1107,6 +2028,10 @@ export default function App() {
     const formattedRenewalDate = formatDateIL(renewalDate);
     const recordTimestamp =
       renewalDate === todayStr ? `${formattedRenewalDate} ${timeStr}` : formattedRenewalDate;
+
+    // Persist names to quick-pick history
+    setSavedTechnicians((prev) => [cleanTech, ...prev.filter((n) => n.trim() !== cleanTech)]);
+    setSavedEscorts((prev) => [cleanEscort, ...prev.filter((n) => n.trim() !== cleanEscort)]);
 
     const renewalRecord = {
       id: Date.now() + Math.random(),
@@ -1131,7 +2056,6 @@ export default function App() {
               (a, b) => (b.isoDate || '').localeCompare(a.isoDate || '')
             );
 
-            // Keep lastFilterRefreshDate set to the most recent renewal date
             const newestRefreshIso = updatedHistory[0]?.isoDate || renewalDate;
 
             return {
@@ -1269,6 +2193,7 @@ export default function App() {
               cartridgeCarriage: 'יש עגלה',
               tankTagExpiry: todayStr,
               notes: '',
+              photos: [],
               filterRefreshHistory: []
             }
           ]
@@ -1395,6 +2320,8 @@ export default function App() {
       setSelectedLocationId(null);
       setLastGlobalUpdateDate('');
       setActionHistory([]);
+      setSavedTechnicians([]);
+      setSavedEscorts([]);
       try {
         window.localStorage.removeItem(STORAGE_KEY);
       } catch {
@@ -1419,14 +2346,7 @@ export default function App() {
     ? 'bg-slate-950 border-slate-700/90 text-slate-100 placeholder-slate-500 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20'
     : 'bg-white border-slate-300/90 text-slate-900 placeholder-slate-400 focus:border-indigo-600 focus:ring-2 focus:ring-indigo-600/15';
 
-  // Helper: Overall location health indicator
-  const isLocationHealthy = (loc) =>
-    loc.filterMaga === 'תקין' &&
-    loc.tankSensitivity === 'תקין' &&
-    loc.filterAlef1 > 20 &&
-    loc.filterAlef2 > 20;
-
-  // Helper: Continuous percentage-based color shade & gradient scale (0% Red -> 50% Amber -> 100% Emerald)
+  // Helper: Continuous percentage-based color shade & gradient scale
   const getFilterShade = (pct) => {
     const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
     const hue = Math.round((clamped / 100) * 145);
@@ -1439,7 +2359,7 @@ export default function App() {
       gradient: `linear-gradient(to left, hsl(${startHue}, 86%, 50%), hsl(${hue}, 82%, ${lightness}%))`,
       tint: `hsla(${hue}, 85%, 50%, ${darkMode ? 0.13 : 0.08})`,
       border: `hsla(${hue}, 80%, 48%, ${darkMode ? 0.35 : 0.28})`,
-      levelLabel: clamped <= 25 ? 'נמוך' : clamped <= 60 ? 'בינוני' : 'גבוה'
+      levelLabel: clamped <= 20 ? 'נמוך' : clamped <= 60 ? 'בינוני' : 'גבוה'
     };
   };
 
@@ -1464,6 +2384,128 @@ export default function App() {
     settings: 'הגדרות מערכת וגיבוי Excel'
   };
 
+  // Reusable Action Center Component (rendered in Tracker & Dashboard)
+  const renderActionCenterBanner = () => {
+    if (urgentAlerts.length === 0) {
+      return (
+        <section
+          className={`rounded-2xl border px-4 py-3 flex items-center justify-between gap-3 ${
+            darkMode
+              ? 'bg-emerald-950/25 border-emerald-500/25 text-emerald-300'
+              : 'bg-emerald-50/70 border-emerald-200/80 text-emerald-800'
+          }`}
+        >
+          <div className="flex items-center gap-2.5 text-xs font-bold">
+            <span className="w-7 h-7 rounded-lg bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 flex items-center justify-center shrink-0">
+              <CheckCircle2 size={16} />
+            </span>
+            <span>מרכז התראות: כל המתקנים, הפילטרים ותגי השמיש תקינים ובתוקף!</span>
+          </div>
+          <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-emerald-500/15">
+            0 חריגים
+          </span>
+        </section>
+      );
+    }
+
+    const criticalCount = urgentAlerts.filter((a) => a.severity === 'critical').length;
+    const warningCount = urgentAlerts.length - criticalCount;
+
+    return (
+      <section
+        className={`rounded-2xl border overflow-hidden transition-all ${
+          darkMode
+            ? 'bg-[#14121D] border-rose-500/35 shadow-sm'
+            : 'bg-white border-rose-200 shadow-sm'
+        }`}
+      >
+        <div
+          onClick={() => setActionCenterExpanded(!actionCenterExpanded)}
+          className={`px-4 py-3 flex flex-wrap items-center justify-between gap-3 cursor-pointer ${
+            darkMode ? 'bg-rose-500/10' : 'bg-rose-50/75'
+          }`}
+        >
+          <div className="flex items-center gap-2.5">
+            <span className="w-8 h-8 rounded-xl bg-rose-600 text-white flex items-center justify-center shadow-sm shrink-0">
+              <Bell size={16} />
+            </span>
+            <div>
+              <div className="flex items-center gap-2">
+                <h2 className="text-xs sm:text-sm font-extrabold text-rose-700 dark:text-rose-300">
+                  מרכז התראות ודברים דחופים (Action Center)
+                </h2>
+                <span className="px-2 py-0.5 rounded-full text-[11px] font-black bg-rose-600 text-white tabular-nums">
+                  {urgentAlerts.length}
+                </span>
+              </div>
+              <p className="text-[11px] opacity-75">
+                {criticalCount > 0 && `${criticalCount} קריטיים (לא תקין / פג תוקף)`}
+                {criticalCount > 0 && warningCount > 0 && ' • '}
+                {warningCount > 0 && `${warningCount} אזהרות (מתחת ל-20% / פג תוך 30 יום)`}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] font-bold opacity-70 hidden sm:inline">
+              {actionCenterExpanded ? 'הסתר פירוט' : 'הצג פירוט'}
+            </span>
+            <span className="p-1.5 rounded-lg hover:bg-black/5 dark:hover:bg-white/5">
+              {actionCenterExpanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+            </span>
+          </div>
+        </div>
+
+        {actionCenterExpanded && (
+          <div className="p-3.5 max-h-56 overflow-y-auto divide-y dark:divide-slate-800/80 space-y-1.5">
+            {urgentAlerts.map((alert) => (
+              <div
+                key={alert.id}
+                onClick={() => {
+                  setSelectedAreaId(alert.areaId);
+                  setSelectedLocationId(alert.locationId);
+                  setActiveView('tracker');
+                }}
+                className={`pt-2 first:pt-0 flex flex-col sm:flex-row sm:items-center justify-between gap-2 cursor-pointer group rounded-lg px-2 py-1.5 transition ${
+                  darkMode ? 'hover:bg-slate-800/60' : 'hover:bg-slate-50'
+                }`}
+              >
+                <div className="flex items-start sm:items-center gap-2.5 min-w-0">
+                  <span
+                    className={`mt-0.5 sm:mt-0 w-2.5 h-2.5 rounded-full shrink-0 ${
+                      alert.severity === 'critical' ? 'bg-rose-600' : 'bg-amber-500'
+                    }`}
+                  />
+                  <div className="min-w-0">
+                    <div className="text-xs font-bold truncate">
+                      אזור {alert.areaName} &gt; {alert.locationName} &gt;{' '}
+                      <span className="text-indigo-600 dark:text-indigo-400">
+                        {alert.dispenserName}
+                      </span>
+                    </div>
+                    <div
+                      className={`text-[11px] font-semibold ${
+                        alert.severity === 'critical'
+                          ? 'text-rose-600 dark:text-rose-400'
+                          : 'text-amber-600 dark:text-amber-400'
+                      }`}
+                    >
+                      {alert.message}
+                    </div>
+                  </div>
+                </div>
+
+                <span className="text-[11px] font-bold text-indigo-600 dark:text-indigo-400 shrink-0 inline-flex items-center gap-1 group-hover:underline">
+                  טפל עכשיו <ArrowUpRight size={13} />
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+    );
+  };
+
   return (
     <div
       dir="rtl"
@@ -1471,12 +2513,56 @@ export default function App() {
         darkMode ? 'bg-[#090D16] text-slate-100' : 'bg-[#F8FAFC] text-slate-900'
       }`}
     >
-      {/* Hidden File Input for Excel Backup Import */}
+      {/* Dedicated Print Stylesheet so Official A4 PDF Report prints cleanly */}
+      <style>{`
+        @media print {
+          body * {
+            visibility: hidden !important;
+          }
+          #aquaops-printable-report,
+          #aquaops-printable-report * {
+            visibility: visible !important;
+          }
+          #aquaops-printable-report {
+            position: fixed !important;
+            inset: 0 !important;
+            width: 100% !important;
+            background: #ffffff !important;
+            color: #0f172a !important;
+            padding: 12mm !important;
+            margin: 0 !important;
+            box-shadow: none !important;
+            border: none !important;
+            overflow: visible !important;
+            z-index: 99999 !important;
+          }
+          .no-print {
+            display: none !important;
+          }
+        }
+      `}</style>
+
+      {/* Hidden File Inputs for Excel Backup & Mobile Camera / Gallery */}
       <input
         ref={fileInputRef}
         type="file"
         accept=".xlsx,.xls,.csv,.json"
         onChange={handleImportExcelFile}
+        className="hidden"
+      />
+      <input
+        ref={cameraInputRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        onChange={handlePhotoFileSelected}
+        className="hidden"
+      />
+      <input
+        ref={galleryInputRef}
+        type="file"
+        accept="image/*"
+        onChange={handlePhotoFileSelected}
         className="hidden"
       />
 
@@ -1505,7 +2591,7 @@ export default function App() {
                   <span className="font-bold text-sm tracking-tight">מעקב מתקני מים</span>
                 </div>
                 <span className="text-[11px] font-medium opacity-55 block">
-                  AquaOps Cloud Platform
+                  AquaOps Field Suite
                 </span>
               </div>
             </div>
@@ -1567,6 +2653,21 @@ export default function App() {
                 </button>
               );
             })}
+
+            {/* Official PDF Report Quick Sidebar Trigger */}
+            <button
+              onClick={() => setShowReportModal(true)}
+              className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-semibold transition-all cursor-pointer mt-2 ${
+                darkMode
+                  ? 'text-indigo-300 bg-indigo-500/10 hover:bg-indigo-500/20 border border-indigo-500/25'
+                  : 'text-indigo-700 bg-indigo-50/60 hover:bg-indigo-100/80 border border-indigo-200/70'
+              }`}
+            >
+              <span className="flex items-center gap-2.5">
+                <Printer size={16} className="text-indigo-600 dark:text-indigo-400" />
+                <span>הפק דוח ביקורת PDF</span>
+              </span>
+            </button>
           </div>
         </div>
 
@@ -1580,7 +2681,7 @@ export default function App() {
             <div className="flex items-center justify-between font-semibold">
               <span className="opacity-70">סיכום מהיר</span>
               <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 font-bold">
-                LIVE
+                OFFLINE READY
               </span>
             </div>
             <div className="flex items-center justify-between text-[11px] opacity-80">
@@ -1693,6 +2794,17 @@ export default function App() {
                     </button>
                   );
                 })}
+
+                <button
+                  onClick={() => {
+                    setMobileMenuOpen(false);
+                    setShowReportModal(true);
+                  }}
+                  className="w-full flex items-center gap-2.5 px-3.5 py-2.5 rounded-xl text-xs font-bold text-indigo-600 dark:text-indigo-400 bg-indigo-500/10 mt-2 cursor-pointer"
+                >
+                  <Printer size={16} />
+                  <span>הפק דוח ביקורת PDF</span>
+                </button>
               </div>
             </div>
             <div className="p-4 border-t dark:border-slate-800 space-y-2">
@@ -1768,20 +2880,64 @@ export default function App() {
               <div className="flex items-center gap-1.5 text-[11px] font-medium opacity-60 truncate">
                 <span>אזור</span>
                 <span>/</span>
-                <span className={currentArea ? 'text-indigo-600 dark:text-indigo-400 font-semibold' : ''}>
+                <span
+                  className={currentArea ? 'text-indigo-600 dark:text-indigo-400 font-semibold' : ''}
+                >
                   {currentArea?.name || 'לא נבחר'}
                 </span>
                 <span>/</span>
-                <span className={currentLocation ? 'text-indigo-600 dark:text-indigo-400 font-semibold' : ''}>
+                <span
+                  className={
+                    currentLocation ? 'text-indigo-600 dark:text-indigo-400 font-semibold' : ''
+                  }
+                >
                   {currentLocation?.name || 'לא נבחר'}
                 </span>
               </div>
             </div>
           </div>
 
-          {/* Top-Left Side (End in RTL): Excel Backup Buttons + Live Table Update Date Badge */}
-          <div className="flex flex-wrap items-center gap-2.5">
-            <div className="hidden sm:flex items-center gap-2">
+          {/* Top-Left Side: Urgent Alert Counter + Official PDF Report + Excel Backup + Live Date */}
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Live Action Center Alert Counter Button (toggles Action Center visibility) */}
+            <button
+              onClick={() => {
+                if (activeView !== 'tracker' && activeView !== 'dashboard') {
+                  setActiveView('tracker');
+                  setActionCenterExpanded(true);
+                } else {
+                  setActionCenterExpanded((prev) => !prev);
+                }
+              }}
+              className={`px-3 py-2 rounded-xl border text-xs font-bold flex items-center gap-1.5 transition cursor-pointer ${
+                urgentAlerts.length > 0
+                  ? 'bg-rose-600 hover:bg-rose-700 text-white border-rose-600 shadow-sm'
+                  : darkMode
+                  ? 'bg-emerald-950/40 border-emerald-500/30 text-emerald-400'
+                  : 'bg-emerald-50 border-emerald-200 text-emerald-700'
+              }`}
+              title="מרכז התראות ודברים דחופים"
+            >
+              <Bell size={14} />
+              <span className="hidden sm:inline">התראות:</span>
+              <span className="tabular-nums font-black">{urgentAlerts.length}</span>
+            </button>
+
+            {/* Official Printable / PDF Report Button */}
+            <button
+              onClick={() => setShowReportModal(true)}
+              className={`px-3 py-2 rounded-xl border text-xs font-bold flex items-center gap-1.5 transition cursor-pointer ${
+                darkMode
+                  ? 'bg-[#111827] border-slate-700 text-indigo-300 hover:bg-slate-800'
+                  : 'bg-indigo-50/70 border-indigo-200 text-indigo-700 hover:bg-indigo-100/80'
+              }`}
+              title="הפק דוח ביקורת רשמי להדפסה או PDF"
+            >
+              <Printer size={14} />
+              <span className="hidden md:inline">דוח PDF</span>
+            </button>
+
+            <div className="hidden xl:flex items-center gap-2">
               <button
                 onClick={handleExportExcelBackup}
                 disabled={isBackupBusy}
@@ -1789,7 +2945,7 @@ export default function App() {
                 title="ייצוא קובץ גיבוי Excel (.xlsx)"
               >
                 <Download size={14} />
-                <span>ייצוא גיבוי Excel</span>
+                <span>ייצוא Excel</span>
               </button>
 
               <button
@@ -1803,33 +2959,31 @@ export default function App() {
                 title="ייבוא קובץ גיבוי Excel (מיזוג ללא דריסה וללא כפילויות)"
               >
                 <Upload size={14} className="text-indigo-600 dark:text-indigo-400" />
-                <span>ייבוא גיבוי Excel</span>
+                <span>ייבוא Excel</span>
               </button>
             </div>
 
             <div
-              className={`px-3.5 py-1.5 rounded-xl border flex items-center gap-3 ${
-                darkMode
-                  ? 'bg-[#111827] border-slate-800'
-                  : 'bg-slate-50 border-slate-200/90'
+              className={`px-3 py-1.5 rounded-xl border flex items-center gap-2.5 ${
+                darkMode ? 'bg-[#111827] border-slate-800' : 'bg-slate-50 border-slate-200/90'
               }`}
             >
               <div className="text-right">
                 <span className="block text-[10px] font-semibold opacity-60">
-                  תאריך עדכון טבלה:
+                  עדכון טבלה:
                 </span>
-                <span className="font-mono font-bold text-sm tabular-nums text-indigo-600 dark:text-indigo-400">
+                <span className="font-mono font-bold text-xs sm:text-sm tabular-nums text-indigo-600 dark:text-indigo-400">
                   {headerTableUpdateDate ? formatDateIL(headerTableUpdateDate) : '__/__/____'}
                 </span>
               </div>
               <div
-                className={`w-8 h-8 rounded-lg flex items-center justify-center ${
+                className={`w-7 h-7 rounded-lg flex items-center justify-center ${
                   headerTableUpdateDate === todayLocalIso
                     ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
                     : 'bg-slate-500/10 opacity-45'
                 }`}
               >
-                <Activity size={16} />
+                <Activity size={15} />
               </div>
             </div>
           </div>
@@ -1843,11 +2997,13 @@ export default function App() {
           </div>
         )}
 
-        {/* FILTER RENEWAL MODAL (Requires Technician, Escort & Custom Renewal Date) */}
+        {/* =================================================================== */}
+        {/* FILTER RENEWAL MODAL (With Quick Technician & Escort Name History)  */}
+        {/* =================================================================== */}
         {showRenewalModal && (
-          <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
             <div
-              className={`w-full max-w-md p-6 rounded-2xl shadow-2xl border ${
+              className={`w-full max-w-md p-6 rounded-2xl shadow-2xl border my-auto ${
                 darkMode
                   ? 'bg-[#111827] border-slate-800 text-slate-100'
                   : 'bg-white border-slate-200 text-slate-900'
@@ -1876,10 +3032,6 @@ export default function App() {
                 {currentArea?.name} / {currentLocation?.name})
               </div>
 
-              <p className="text-xs opacity-75 mb-4 leading-relaxed">
-                הזן את פרטי הטכנאי, המלווה ותאריך הרענון כדי לשמור את הרענון בהיסטוריה הייעודית של המתקן:
-              </p>
-
               {renewalError && (
                 <div className="mb-4 p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-600 dark:text-rose-400 text-xs font-semibold flex items-center gap-2">
                   <AlertTriangle size={15} className="shrink-0" />
@@ -1903,13 +3055,14 @@ export default function App() {
                   />
                 </div>
 
+                {/* Technician Input + Quick History Chips */}
                 <div>
                   <label className="block text-xs font-semibold mb-1.5 flex items-center gap-1.5">
                     <UserCheck size={14} className="text-emerald-600 dark:text-emerald-400" /> שם טכנאי:
                   </label>
                   <input
                     type="text"
-                    placeholder="הזן שם טכנאי..."
+                    placeholder="הזן שם טכנאי או בחר מהיסטוריה..."
                     value={technicianName}
                     onChange={(e) => {
                       setTechnicianName(e.target.value);
@@ -1918,15 +3071,63 @@ export default function App() {
                     className={`w-full px-3.5 py-2.5 rounded-xl border text-sm font-medium outline-none transition ${saasInput}`}
                     autoFocus
                   />
+                  {technicianHistoryList.length > 0 && (
+                    <div className="mt-2">
+                      <span className="block text-[10px] font-semibold opacity-60 mb-1">
+                        בחירה מהירה של טכנאי:
+                      </span>
+                      <div className="flex flex-wrap gap-1.5">
+                        {technicianHistoryList.map((name) => {
+                          const isSelected = technicianName.trim() === name;
+                          return (
+                            <span
+                              key={name}
+                              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border text-[11px] font-semibold transition ${
+                                isSelected
+                                  ? 'bg-emerald-600 text-white border-emerald-600'
+                                  : darkMode
+                                  ? 'bg-slate-900 border-slate-700 text-slate-300 hover:border-emerald-500/50'
+                                  : 'bg-slate-50 border-slate-200 text-slate-700 hover:border-emerald-400'
+                              }`}
+                            >
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setTechnicianName(name);
+                                  if (renewalError) setRenewalError('');
+                                }}
+                                className="cursor-pointer"
+                              >
+                                {name}
+                              </button>
+                              {savedTechnicians.includes(name) && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setSavedTechnicians((prev) => prev.filter((n) => n !== name))
+                                  }
+                                  className="opacity-60 hover:opacity-100 mr-0.5 cursor-pointer"
+                                  title="הסר מהרשימה"
+                                >
+                                  ×
+                                </button>
+                              )}
+                            </span>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
                 </div>
 
+                {/* Escort Input + Quick History Chips */}
                 <div>
                   <label className="block text-xs font-semibold mb-1.5 flex items-center gap-1.5">
                     <ShieldCheck size={14} className="text-indigo-600 dark:text-indigo-400" /> שם מלווה:
                   </label>
                   <input
                     type="text"
-                    placeholder="הזן שם מלווה..."
+                    placeholder="הזן שם מלווה או בחר מהיסטוריה..."
                     value={escortName}
                     onChange={(e) => {
                       setEscortName(e.target.value);
@@ -1935,6 +3136,53 @@ export default function App() {
                     onKeyDown={(e) => e.key === 'Enter' && handleConfirmFilterRenewal()}
                     className={`w-full px-3.5 py-2.5 rounded-xl border text-sm font-medium outline-none transition ${saasInput}`}
                   />
+                  {escortHistoryList.length > 0 && (
+                    <div className="mt-2">
+                      <span className="block text-[10px] font-semibold opacity-60 mb-1">
+                        בחירה מהירה של מלווה:
+                      </span>
+                      <div className="flex flex-wrap gap-1.5">
+                        {escortHistoryList.map((name) => {
+                          const isSelected = escortName.trim() === name;
+                          return (
+                            <span
+                              key={name}
+                              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border text-[11px] font-semibold transition ${
+                                isSelected
+                                  ? 'bg-indigo-600 text-white border-indigo-600'
+                                  : darkMode
+                                  ? 'bg-slate-900 border-slate-700 text-slate-300 hover:border-indigo-500/50'
+                                  : 'bg-slate-50 border-slate-200 text-slate-700 hover:border-indigo-400'
+                              }`}
+                            >
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setEscortName(name);
+                                  if (renewalError) setRenewalError('');
+                                }}
+                                className="cursor-pointer"
+                              >
+                                {name}
+                              </button>
+                              {savedEscorts.includes(name) && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setSavedEscorts((prev) => prev.filter((n) => n !== name))
+                                  }
+                                  className="opacity-60 hover:opacity-100 mr-0.5 cursor-pointer"
+                                  title="הסר מהרשימה"
+                                >
+                                  ×
+                                </button>
+                              )}
+                            </span>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 <label
@@ -1966,6 +3214,307 @@ export default function App() {
                 >
                   ביטול
                 </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* =================================================================== */}
+        {/* QR CODE LABEL MODAL PER DISPENSER (OFFLINE READY)                   */}
+        {/* =================================================================== */}
+        {showQrModal && currentLocation && currentArea && (
+          <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4">
+            <div
+              className={`w-full max-w-sm p-6 rounded-2xl shadow-2xl border text-center ${
+                darkMode
+                  ? 'bg-[#111827] border-slate-800 text-slate-100'
+                  : 'bg-white border-slate-200 text-slate-900'
+              }`}
+            >
+              <div className="flex items-center justify-between pb-3 mb-4 border-b dark:border-slate-800">
+                <div className="flex items-center gap-2">
+                  <div className="w-8 h-8 rounded-lg bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 flex items-center justify-center">
+                    <QrCode size={17} />
+                  </div>
+                  <h3 className="text-sm font-bold">תווית QR למתקן</h3>
+                </div>
+                <button
+                  onClick={() => setShowQrModal(false)}
+                  className="p-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
+                >
+                  <X size={17} />
+                </button>
+              </div>
+
+              <div className="mb-4">
+                <QrCodeSvg value={currentDispenserQrUrl} size={210} />
+              </div>
+
+              <div className={`p-3 rounded-xl border mb-5 space-y-1 ${saasPanelInset}`}>
+                <div className="text-sm font-extrabold text-indigo-600 dark:text-indigo-400">
+                  {currentLocation.dispenserName}
+                </div>
+                <div className="text-xs font-semibold opacity-75">
+                  אזור: {currentArea.name} • מקום: {currentLocation.name}
+                </div>
+                <p className="text-[11px] opacity-60 pt-1">
+                  הדפס או הדבק תווית זו על המתקן. סריקה במצלמת הפלאפון תפתח ישירות את כרטיס המתקן!
+                </p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2.5">
+                <button
+                  onClick={handleDownloadQrPng}
+                  className="py-2.5 px-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-sm transition cursor-pointer"
+                >
+                  <Download size={14} /> הורד תווית PNG
+                </button>
+                <button
+                  onClick={() => setShowQrModal(false)}
+                  className="py-2.5 px-3 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-xs font-semibold transition cursor-pointer"
+                >
+                  סגור
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* =================================================================== */}
+        {/* PHOTO LIGHTBOX PREVIEW MODAL                                        */}
+        {/* =================================================================== */}
+        {lightboxPhoto && (
+          <div
+            className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-4"
+            onClick={() => setLightboxPhoto(null)}
+          >
+            <div
+              className="max-w-2xl w-full bg-slate-900 border border-slate-700 rounded-2xl overflow-hidden shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="px-4 py-3 border-b border-slate-800 flex items-center justify-between text-white">
+                <div className="text-xs font-bold">
+                  {lightboxPhoto.category} •{' '}
+                  <span className="font-mono opacity-75">{lightboxPhoto.date}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => handleDeletePhoto(lightboxPhoto.id)}
+                    className="px-2.5 py-1 rounded-lg bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold flex items-center gap-1 cursor-pointer"
+                  >
+                    <Trash2 size={13} /> מחק תמונה
+                  </button>
+                  <button
+                    onClick={() => setLightboxPhoto(null)}
+                    className="p-1.5 rounded-lg hover:bg-slate-800 cursor-pointer"
+                  >
+                    <X size={18} />
+                  </button>
+                </div>
+              </div>
+              <div className="p-2 bg-black flex items-center justify-center max-h-[75vh]">
+                <img
+                  src={lightboxPhoto.dataUrl}
+                  alt={lightboxPhoto.category}
+                  className="max-h-[70vh] w-auto object-contain rounded-lg"
+                />
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* =================================================================== */}
+        {/* OFFICIAL A4 PRINTABLE / PDF INSPECTION REPORT MODAL                 */}
+        {/* =================================================================== */}
+        {showReportModal && (
+          <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-sm flex items-center justify-center p-2 sm:p-4 overflow-y-auto">
+            <div className="w-full max-w-5xl bg-white text-slate-900 rounded-2xl shadow-2xl border border-slate-200 overflow-hidden my-auto">
+              {/* Top Modal Toolbar (Hidden when printing) */}
+              <div className="no-print px-5 py-3.5 bg-slate-900 text-white flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5">
+                  <Printer size={18} className="text-indigo-400" />
+                  <span className="text-sm font-bold">תצוגה מקדימה: דוח ביקורת רשמי להדפסה / PDF</span>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <input
+                    type="text"
+                    placeholder="שם עורך הביקורת (אופציונלי)..."
+                    value={reportInspectorName}
+                    onChange={(e) => setReportInspectorName(e.target.value)}
+                    className="px-3 py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-xs text-white placeholder-slate-400 outline-none"
+                  />
+                  <button
+                    onClick={() => window.print()}
+                    className="px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold flex items-center gap-1.5 shadow-sm cursor-pointer"
+                  >
+                    <Printer size={14} /> הדפס / שמור כ-PDF
+                  </button>
+                  <button
+                    onClick={() => setShowReportModal(false)}
+                    className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-300 cursor-pointer"
+                  >
+                    <X size={18} />
+                  </button>
+                </div>
+              </div>
+
+              {/* Printable A4 Sheet Content */}
+              <div
+                id="aquaops-printable-report"
+                dir="rtl"
+                className="p-6 sm:p-10 space-y-6 max-h-[82vh] overflow-y-auto bg-white text-slate-900"
+              >
+                {/* Official Report Header */}
+                <div className="border-b-2 border-slate-900 pb-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div>
+                    <span className="text-xs font-bold text-indigo-700 tracking-wider uppercase block">
+                      AQUAOPS PRO • מערכת ניהול ובקרת איכות מים
+                    </span>
+                    <h2 className="text-xl sm:text-2xl font-black text-slate-900 mt-0.5">
+                      דוח ביקורת ותקינות מתקני מים ומיכלים
+                    </h2>
+                  </div>
+                  <div className="text-xs space-y-1 text-right sm:text-left">
+                    <div>
+                      <strong>תאריך הפקת דוח:</strong>{' '}
+                      <span className="font-mono">{getNowStrings().fullDateTime}</span>
+                    </div>
+                    {reportInspectorName.trim() && (
+                      <div>
+                        <strong>עורך הביקורת:</strong> {reportInspectorName.trim()}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Summary Boxes */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  <div className="p-3 rounded-xl border border-slate-300 bg-slate-50">
+                    <span className="text-[11px] font-bold text-slate-500 block">סה״כ אזורים</span>
+                    <span className="text-xl font-black text-slate-900">{areas.length}</span>
+                  </div>
+                  <div className="p-3 rounded-xl border border-slate-300 bg-slate-50">
+                    <span className="text-[11px] font-bold text-slate-500 block">סה״כ מתקנים ומיכלים</span>
+                    <span className="text-xl font-black text-slate-900">{allDispensers.length}</span>
+                  </div>
+                  <div className="p-3 rounded-xl border border-emerald-300 bg-emerald-50">
+                    <span className="text-[11px] font-bold text-emerald-700 block">מערכות תקינות</span>
+                    <span className="text-xl font-black text-emerald-800">
+                      {allDispensers.filter((d) => isLocationHealthy(d)).length}
+                    </span>
+                  </div>
+                  <div className="p-3 rounded-xl border border-rose-300 bg-rose-50">
+                    <span className="text-[11px] font-bold text-rose-700 block">חריגים / התראות</span>
+                    <span className="text-xl font-black text-rose-800">{urgentAlerts.length}</span>
+                  </div>
+                </div>
+
+                {/* Section 1: Urgent Exceptions */}
+                <div className="space-y-2">
+                  <h3 className="text-sm font-black text-slate-900 border-b border-slate-300 pb-1.5">
+                    1. סיכום חריגים והתראות הדורשות טיפול ({urgentAlerts.length})
+                  </h3>
+                  {urgentAlerts.length === 0 ? (
+                    <p className="text-xs text-emerald-700 font-semibold py-2">
+                      לא נמצאו חריגים בביקורת זו — כל המתקנים, הפילטרים ותגי השמיש תקינים ובתוקף.
+                    </p>
+                  ) : (
+                    <table className="w-full text-right border-collapse text-xs border border-slate-300">
+                      <thead>
+                        <tr className="bg-slate-100 border-b border-slate-300 font-bold">
+                          <th className="py-2 px-3 border-l border-slate-300">אזור</th>
+                          <th className="py-2 px-3 border-l border-slate-300">מיקום</th>
+                          <th className="py-2 px-3 border-l border-slate-300">מתקן</th>
+                          <th className="py-2 px-3">פירוט החריג / ההתראה</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-200">
+                        {urgentAlerts.map((al) => (
+                          <tr key={al.id}>
+                            <td className="py-2 px-3 border-l border-slate-300 font-bold">
+                              {al.areaName}
+                            </td>
+                            <td className="py-2 px-3 border-l border-slate-300">
+                              {al.locationName}
+                            </td>
+                            <td className="py-2 px-3 border-l border-slate-300 font-bold">
+                              {al.dispenserName}
+                            </td>
+                            <td className="py-2 px-3 text-rose-700 font-semibold">{al.message}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+
+                {/* Section 2: Complete Inventory Table */}
+                <div className="space-y-2">
+                  <h3 className="text-sm font-black text-slate-900 border-b border-slate-300 pb-1.5">
+                    2. טבלת סטטוס מתקנים ומיכלים מפורטת ({allDispensers.length})
+                  </h3>
+                  {allDispensers.length === 0 ? (
+                    <p className="text-xs text-slate-500 py-2">אין מתקנים רשומים במערכת.</p>
+                  ) : (
+                    <table className="w-full text-right border-collapse text-[11px] border border-slate-300">
+                      <thead>
+                        <tr className="bg-slate-100 border-b border-slate-300 font-bold">
+                          <th className="py-2 px-2 border-l border-slate-300">אזור / מיקום</th>
+                          <th className="py-2 px-2 border-l border-slate-300">שם מתקן</th>
+                          <th className="py-2 px-2 border-l border-slate-300">מגה</th>
+                          <th className="py-2 px-2 border-l border-slate-300">אלף 1 / 2</th>
+                          <th className="py-2 px-2 border-l border-slate-300">תוקף תג מתקן</th>
+                          <th className="py-2 px-2 border-l border-slate-300">רגישות מיכל</th>
+                          <th className="py-2 px-2 border-l border-slate-300">תוקף תג מיכל</th>
+                          <th className="py-2 px-2 border-l border-slate-300">רענון אחרון</th>
+                          <th className="py-2 px-2">הערות</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-200">
+                        {allDispensers.map((d) => (
+                          <tr key={d.id}>
+                            <td className="py-2 px-2 border-l border-slate-300">
+                              <strong>{d.areaName}</strong> / {d.name}
+                            </td>
+                            <td className="py-2 px-2 border-l border-slate-300 font-bold">
+                              {d.dispenserName}
+                            </td>
+                            <td className="py-2 px-2 border-l border-slate-300 font-semibold">
+                              {d.filterMaga}
+                            </td>
+                            <td className="py-2 px-2 border-l border-slate-300 font-mono">
+                              {d.filterAlef1}% / {d.filterAlef2}%
+                            </td>
+                            <td className="py-2 px-2 border-l border-slate-300 font-mono">
+                              {d.tagExpiry ? formatDateIL(d.tagExpiry) : '-'}
+                            </td>
+                            <td className="py-2 px-2 border-l border-slate-300">
+                              {d.tankSensitivity} ({d.cartridgeCarriage})
+                            </td>
+                            <td className="py-2 px-2 border-l border-slate-300 font-mono">
+                              {d.tankTagExpiry ? formatDateIL(d.tankTagExpiry) : '-'}
+                            </td>
+                            <td className="py-2 px-2 border-l border-slate-300 font-mono">
+                              {d.lastFilterRefreshDate ? formatDateIL(d.lastFilterRefreshDate) : '-'}
+                            </td>
+                            <td className="py-2 px-2">{d.notes || '-'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+
+                {/* Official Signature Block */}
+                <div className="pt-8 mt-6 border-t border-slate-300 flex items-center justify-between text-xs text-slate-600">
+                  <div>
+                    <strong>חתימת מבצע הביקורת:</strong> ___________________________
+                  </div>
+                  <div>
+                    <strong>אישור אחראי תחום:</strong> ___________________________
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -2015,10 +3564,13 @@ export default function App() {
         {/* =================================================================== */}
         <main className="flex-1 max-w-[1520px] w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
           {/* ================================================================= */}
-          {/* VIEW 1: TRACKER (SaaS Areas Bar + Master-Detail Split View)       */}
+          {/* VIEW 1: TRACKER (Action Center + Areas Bar + Master-Detail View)  */}
           {/* ================================================================= */}
           {activeView === 'tracker' && (
             <div className="space-y-5">
+              {/* SMART URGENT ACTION CENTER */}
+              {allDispensers.length > 0 && renderActionCenterBanner()}
+
               {/* STEP 1: AREAS HORIZONTAL SAAS BAR */}
               <section className={`rounded-2xl border p-4 ${saasCard}`}>
                 <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
@@ -2230,6 +3782,7 @@ export default function App() {
                       {currentArea.locations.map((loc) => {
                         const isSelected = selectedLocationId === loc.id;
                         const healthy = isLocationHealthy(loc);
+                        const tagAlert = hasExpiredOrExpiringTag(loc);
                         return (
                           <div
                             key={loc.id}
@@ -2278,9 +3831,19 @@ export default function App() {
                                 <div className="flex items-center gap-3 min-w-0">
                                   <span
                                     className={`w-2.5 h-2.5 rounded-full shrink-0 ${
-                                      healthy ? 'bg-emerald-500' : 'bg-amber-500'
+                                      !healthy
+                                        ? 'bg-rose-500'
+                                        : tagAlert
+                                        ? 'bg-amber-500'
+                                        : 'bg-emerald-500'
                                     }`}
-                                    title={healthy ? 'מערכת תקינה' : 'דורש תשומת לב'}
+                                    title={
+                                      !healthy
+                                        ? 'תקלה / פילטר נמוך'
+                                        : tagAlert
+                                        ? 'תוקף תג קרוב או פג'
+                                        : 'מערכת תקינה'
+                                    }
                                   />
                                   <div className="truncate">
                                     <div className="font-bold text-xs sm:text-sm truncate">
@@ -2322,7 +3885,9 @@ export default function App() {
 
                       {/* Inline Add Location + Dispenser Form */}
                       {isAddingLocation ? (
-                        <div className={`p-3.5 rounded-xl border border-indigo-500/50 space-y-2.5 ${saasPanelInset}`}>
+                        <div
+                          className={`p-3.5 rounded-xl border border-indigo-500/50 space-y-2.5 ${saasPanelInset}`}
+                        >
                           <input
                             type="text"
                             placeholder="שם המקום (לדוגמה: מקום - 3)..."
@@ -2374,7 +3939,7 @@ export default function App() {
                   )}
                 </section>
 
-                {/* DETAIL INSPECTOR PANE (8 cols): DISPENSER + WATER TANK + NOTES */}
+                {/* DETAIL INSPECTOR PANE (8 cols): DISPENSER + WATER TANK + PHOTOS + NOTES */}
                 <div className="lg:col-span-8">
                   {!currentLocation ? (
                     <div
@@ -2408,12 +3973,12 @@ export default function App() {
                           />
                         </div>
 
-                        <div className="flex flex-wrap items-center gap-2.5">
+                        <div className="flex flex-wrap items-center gap-2">
                           <div
                             className={`px-3 py-2 rounded-xl border text-xs flex items-center gap-1.5 ${saasPanelInset}`}
                           >
                             <Clock size={14} className="text-emerald-600 dark:text-emerald-400" />
-                            <span className="opacity-70">רענון פילטרים אחרון:</span>
+                            <span className="opacity-70">רענון אחרון:</span>
                             <strong className="font-mono tabular-nums">
                               {currentLocation.lastFilterRefreshDate
                                 ? formatDateIL(currentLocation.lastFilterRefreshDate)
@@ -2423,21 +3988,33 @@ export default function App() {
 
                           <button
                             onClick={openFilterRenewalModal}
-                            className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex items-center gap-1.5 shadow-sm transition cursor-pointer"
+                            className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex items-center gap-1.5 shadow-sm transition cursor-pointer"
                           >
                             <Wrench size={14} /> רענון פילטרים
                           </button>
 
                           <button
+                            onClick={() => setShowQrModal(true)}
+                            className={`px-3.5 py-2 rounded-xl border text-xs font-bold flex items-center gap-1.5 transition cursor-pointer ${
+                              darkMode
+                                ? 'bg-indigo-500/15 border-indigo-500/30 text-indigo-300 hover:bg-indigo-500/25'
+                                : 'bg-indigo-50 border-indigo-200 text-indigo-700 hover:bg-indigo-100'
+                            }`}
+                            title="הצג והורד קוד QR לסריקה מהירה מהשטח"
+                          >
+                            <QrCode size={14} /> תווית QR
+                          </button>
+
+                          <button
                             onClick={() => setActiveView('dispenser_history')}
-                            className={`px-3.5 py-2 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
+                            className={`px-3 py-2 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
                               darkMode
                                 ? 'bg-slate-900 border-slate-700 hover:bg-slate-800 text-slate-200'
                                 : 'bg-white border-slate-200 hover:bg-slate-50 text-slate-700'
                             }`}
                           >
                             <History size={14} />
-                            היסטוריית רענונים ({currentLocation.filterRefreshHistory?.length || 0})
+                            רענונים ({currentLocation.filterRefreshHistory?.length || 0})
                           </button>
                         </div>
                       </div>
@@ -2445,7 +4022,9 @@ export default function App() {
                       {/* Two-Column SaaS Specifications Grid: Water Dispenser + Water Tank */}
                       <div className="grid grid-cols-1 xl:grid-cols-12 gap-5">
                         {/* WATER DISPENSER SPEC SHEET (7 cols) */}
-                        <section className={`xl:col-span-7 rounded-2xl border p-5 space-y-5 ${saasCard}`}>
+                        <section
+                          className={`xl:col-span-7 rounded-2xl border p-5 space-y-5 ${saasCard}`}
+                        >
                           <div className="flex items-center justify-between pb-3 border-b dark:border-slate-800">
                             <div className="flex items-center gap-2">
                               <span className="w-7 h-7 rounded-lg bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 flex items-center justify-center">
@@ -2707,7 +4286,7 @@ export default function App() {
 
                           {/* NOTES CARD */}
                           <section
-                            className={`rounded-2xl border p-5 flex-1 flex flex-col min-h-[170px] ${saasCard}`}
+                            className={`rounded-2xl border p-5 flex-1 flex flex-col min-h-[160px] ${saasCard}`}
                           >
                             <div className="flex items-center gap-2 mb-2.5">
                               <span className="w-6 h-6 rounded-lg bg-amber-500/10 text-amber-600 dark:text-amber-400 flex items-center justify-center">
@@ -2724,6 +4303,115 @@ export default function App() {
                           </section>
                         </div>
                       </div>
+
+                      {/* ================================================================= */}
+                      {/* MOBILE CAMERA & COMPRESSED PHOTO DOCUMENTATION CARD               */}
+                      {/* ================================================================= */}
+                      <section className={`rounded-2xl border p-5 space-y-4 ${saasCard}`}>
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b dark:border-slate-800">
+                          <div className="flex items-center gap-2">
+                            <span className="w-7 h-7 rounded-lg bg-purple-500/10 text-purple-600 dark:text-purple-400 flex items-center justify-center">
+                              <Camera size={16} />
+                            </span>
+                            <div>
+                              <h3 className="text-sm font-bold">
+                                תיעוד ויזואלי (צילום תג שמיש / תקלה)
+                              </h3>
+                              <span className="text-[11px] opacity-60">
+                                דחיסה אוטומטית לשמירה קלת משקל באופליין ({(currentLocation.photos || []).length} תמונות)
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-2">
+                            <select
+                              value={photoCategory}
+                              onChange={(e) => setPhotoCategory(e.target.value)}
+                              className={`px-3 py-2 rounded-xl border text-xs font-semibold outline-none ${saasInput}`}
+                            >
+                              <option value="תג שמיש מתקן">תג שמיש מתקן</option>
+                              <option value="תג שמיש מיכל">תג שמיש מיכל</option>
+                              <option value="תיעוד תקלה">תיעוד תקלה</option>
+                              <option value="כללי">כללי</option>
+                            </select>
+
+                            <button
+                              onClick={() => cameraInputRef.current?.click()}
+                              disabled={isCompressingPhoto}
+                              className="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white text-xs font-bold flex items-center gap-1.5 shadow-sm transition cursor-pointer"
+                            >
+                              <Camera size={14} />
+                              <span>{isCompressingPhoto ? 'מעבד...' : 'צלם תמונה'}</span>
+                            </button>
+
+                            <button
+                              onClick={() => galleryInputRef.current?.click()}
+                              disabled={isCompressingPhoto}
+                              className={`px-3 py-2 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
+                                darkMode
+                                  ? 'bg-slate-900 border-slate-700 hover:bg-slate-800 text-slate-200'
+                                  : 'bg-white border-slate-200 hover:bg-slate-50 text-slate-700'
+                              }`}
+                            >
+                              <ImageIcon size={14} />
+                              <span>גלריה</span>
+                            </button>
+                          </div>
+                        </div>
+
+                        {(currentLocation.photos || []).length === 0 ? (
+                          <div
+                            className={`py-6 px-4 rounded-xl border border-dashed text-center text-xs font-medium opacity-60 ${
+                              darkMode ? 'border-slate-800' : 'border-slate-300'
+                            }`}
+                          >
+                            אין תמונות שמורות למתקן זה. לחץ על &quot;צלם תמונה&quot; כדי לצלם תג שמיש או תקלה ישירות מהפלאפון.
+                          </div>
+                        ) : (
+                          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
+                            {(currentLocation.photos || []).map((photo) => (
+                              <div
+                                key={photo.id}
+                                className={`group relative rounded-xl border overflow-hidden ${saasPanelInset}`}
+                              >
+                                <div
+                                  onClick={() => setLightboxPhoto(photo)}
+                                  className="aspect-square w-full bg-slate-950 overflow-hidden cursor-pointer relative"
+                                >
+                                  <img
+                                    src={photo.dataUrl}
+                                    alt={photo.category}
+                                    className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200"
+                                  />
+                                  <div className="absolute inset-0 bg-black/0 group-hover:bg-black/30 transition flex items-center justify-center">
+                                    <ZoomIn
+                                      size={20}
+                                      className="text-white opacity-0 group-hover:opacity-100 transition"
+                                    />
+                                  </div>
+                                </div>
+                                <div className="p-2 flex items-center justify-between gap-1">
+                                  <div className="min-w-0">
+                                    <span className="block text-[11px] font-bold truncate">
+                                      {photo.category}
+                                    </span>
+                                    <span className="block text-[10px] font-mono opacity-60 truncate">
+                                      {photo.date}
+                                    </span>
+                                  </div>
+                                  <button
+                                    onClick={() => handleDeletePhoto(photo.id)}
+                                    className="p-1.5 rounded-lg hover:bg-rose-500/15 text-rose-500 shrink-0 cursor-pointer"
+                                    title="מחק תמונה"
+                                  >
+                                    <Trash2 size={13} />
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </section>
                     </div>
                   )}
                 </div>
@@ -2732,10 +4420,13 @@ export default function App() {
           )}
 
           {/* ================================================================= */}
-          {/* VIEW 2: SAAS DASHBOARD (KPIs + 6m/1y Table + Full Breakdown)      */}
+          {/* VIEW 2: SAAS DASHBOARD (Action Center + KPIs + Advanced Filters)  */}
           {/* ================================================================= */}
           {activeView === 'dashboard' && (
             <div className="space-y-6">
+              {/* SMART URGENT ACTION CENTER */}
+              {allDispensers.length > 0 && renderActionCenterBanner()}
+
               {/* Top KPI Metrics Row */}
               <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
                 {[
@@ -2746,16 +4437,10 @@ export default function App() {
                     accent: 'text-indigo-600 dark:text-indigo-400 bg-indigo-500/10'
                   },
                   {
-                    label: 'סה״כ מקומות',
-                    value: allDispensers.length,
-                    icon: MapPin,
-                    accent: 'text-sky-600 dark:text-sky-400 bg-sky-500/10'
-                  },
-                  {
-                    label: 'מתקני מים פעילים',
+                    label: 'סה״כ מקומות ומתקנים',
                     value: allDispensers.length,
                     icon: Droplet,
-                    accent: 'text-blue-600 dark:text-blue-400 bg-blue-500/10'
+                    accent: 'text-sky-600 dark:text-sky-400 bg-sky-500/10'
                   },
                   {
                     label: 'רענוני פילטרים שבוצעו',
@@ -2765,6 +4450,15 @@ export default function App() {
                     ),
                     icon: Wrench,
                     accent: 'text-emerald-600 dark:text-emerald-400 bg-emerald-500/10'
+                  },
+                  {
+                    label: 'התראות וחריגים דחופים',
+                    value: urgentAlerts.length,
+                    icon: Bell,
+                    accent:
+                      urgentAlerts.length > 0
+                        ? 'text-rose-600 dark:text-rose-400 bg-rose-500/10'
+                        : 'text-emerald-600 dark:text-emerald-400 bg-emerald-500/10'
                   }
                 ].map((kpi, idx) => {
                   const Icon = kpi.icon;
@@ -2779,7 +4473,9 @@ export default function App() {
                           {kpi.value}
                         </span>
                       </div>
-                      <div className={`w-11 h-11 rounded-xl flex items-center justify-center ${kpi.accent}`}>
+                      <div
+                        className={`w-11 h-11 rounded-xl flex items-center justify-center ${kpi.accent}`}
+                      >
                         <Icon size={21} />
                       </div>
                     </div>
@@ -2903,37 +4599,28 @@ export default function App() {
                 )}
               </section>
 
-              {/* Full Comprehensive Dispensers Breakdown Table */}
+              {/* Full Comprehensive Dispensers Breakdown Table with Advanced Filtering & Sorting */}
               <section className={`rounded-2xl border p-5 sm:p-6 ${saasCard}`}>
-                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-5">
+                <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 mb-4">
                   <div>
                     <h2 className="text-base font-bold flex items-center gap-2">
                       <Table size={18} className="text-indigo-600 dark:text-indigo-400" />
-                      פירוט מלא של כל המתקנים במערכת
+                      פירוט מלא של כל המתקנים במערכת ({filteredDispensers.length})
                     </h2>
                     <p className="text-xs opacity-60 mt-0.5">
-                      כולל סקלת גוונים השוואתית בין פילטר אלף 1 לאלף 2 לכל מתקן — לחץ על שורה לעריכה
+                      כולל סינון חריגים, מיון לפי אחוז פילטר נמוך וסקלת גוונים השוואתית — לחץ על שורה לעריכה
                     </p>
                   </div>
 
-                  <div className="flex flex-wrap items-center gap-3">
-                    {/* Color Shade Scale Legend */}
-                    <div
-                      className={`px-3 py-1.5 rounded-xl border text-[11px] font-semibold flex items-center gap-2 ${saasPanelInset}`}
+                  <div className="flex flex-wrap items-center gap-2.5">
+                    <button
+                      onClick={() => setShowReportModal(true)}
+                      className="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold flex items-center gap-1.5 shadow-sm transition cursor-pointer"
                     >
-                      <span className="opacity-65">סקלת גוונים:</span>
-                      <span className="text-rose-500 font-bold">0%</span>
-                      <span
-                        className="w-16 h-2 rounded-full inline-block"
-                        style={{
-                          background:
-                            'linear-gradient(to left, hsl(0, 84%, 52%), hsl(45, 90%, 48%), hsl(145, 76%, 42%))'
-                        }}
-                      />
-                      <span className="text-emerald-500 font-bold">100%</span>
-                    </div>
+                      <Printer size={14} /> הפק דוח PDF / הדפסה
+                    </button>
 
-                    <div className="relative w-full md:w-64">
+                    <div className="relative w-full sm:w-60">
                       <Search
                         size={15}
                         className="absolute right-3.5 top-1/2 -translate-y-1/2 opacity-45"
@@ -2949,11 +4636,104 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* ADVANCED FILTER & SORT TOOLBAR */}
+                <div
+                  className={`p-3 rounded-xl border mb-5 flex flex-wrap items-center justify-between gap-3 ${saasPanelInset}`}
+                >
+                  {/* Status Quick Filter Pills */}
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[11px] font-bold opacity-65 flex items-center gap-1 ml-1">
+                      <Filter size={13} /> סינון מהיר:
+                    </span>
+                    {[
+                      { id: 'all', label: `הכל (${allDispensers.length})` },
+                      {
+                        id: 'faulty',
+                        label: `רק לא תקינים / נמוכים (${
+                          allDispensers.filter((d) => !isLocationHealthy(d)).length
+                        })`
+                      },
+                      {
+                        id: 'expired',
+                        label: `פגי תוקף / מתקרבים (${
+                          allDispensers.filter((d) => hasExpiredOrExpiringTag(d)).length
+                        })`
+                      }
+                    ].map((tab) => (
+                      <button
+                        key={tab.id}
+                        onClick={() => setDashboardStatusFilter(tab.id)}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer ${
+                          dashboardStatusFilter === tab.id
+                            ? tab.id === 'faulty'
+                              ? 'bg-rose-600 text-white shadow-sm'
+                              : tab.id === 'expired'
+                              ? 'bg-amber-600 text-white shadow-sm'
+                              : 'bg-indigo-600 text-white shadow-sm'
+                            : darkMode
+                            ? 'bg-slate-900 text-slate-300 hover:bg-slate-800 border border-slate-700'
+                            : 'bg-white text-slate-700 hover:bg-slate-100 border border-slate-200'
+                        }`}
+                      >
+                        {tab.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Area Filter + Sort Dropdown + Reset */}
+                  <div className="flex flex-wrap items-center gap-2">
+                    <select
+                      value={dashboardAreaFilter}
+                      onChange={(e) => setDashboardAreaFilter(e.target.value)}
+                      className={`px-3 py-1.5 rounded-lg border text-xs font-semibold outline-none ${saasInput}`}
+                      title="סינון לפי אזור"
+                    >
+                      <option value="all">כל האזורים</option>
+                      {areas.map((a) => (
+                        <option key={a.id} value={a.id}>
+                          אזור: {a.name}
+                        </option>
+                      ))}
+                    </select>
+
+                    <div className="flex items-center gap-1">
+                      <ArrowUpDown size={13} className="opacity-60" />
+                      <select
+                        value={dashboardSortBy}
+                        onChange={(e) => setDashboardSortBy(e.target.value)}
+                        className={`px-3 py-1.5 rounded-lg border text-xs font-semibold outline-none ${saasInput}`}
+                        title="מיון רשימה"
+                      >
+                        <option value="default">מיון: סדר רגיל</option>
+                        <option value="lowest_filter">מיון: אחוז פילטר הנמוך ביותר</option>
+                        <option value="nearest_expiry">מיון: תוקף תג הקרוב ביותר</option>
+                      </select>
+                    </div>
+
+                    {(dashboardStatusFilter !== 'all' ||
+                      dashboardAreaFilter !== 'all' ||
+                      dashboardSortBy !== 'default' ||
+                      dashboardSearch.trim() !== '') && (
+                      <button
+                        onClick={() => {
+                          setDashboardStatusFilter('all');
+                          setDashboardAreaFilter('all');
+                          setDashboardSortBy('default');
+                          setDashboardSearch('');
+                        }}
+                        className="px-2.5 py-1.5 rounded-lg bg-rose-500/10 text-rose-600 dark:text-rose-400 text-xs font-bold hover:bg-rose-500/20 cursor-pointer"
+                      >
+                        נקה סינון
+                      </button>
+                    )}
+                  </div>
+                </div>
+
                 {filteredDispensers.length === 0 ? (
                   <div className="py-12 text-center text-xs font-medium opacity-55">
                     {allDispensers.length === 0
                       ? 'אין נתונים להצגה. הוסף אזורים, מקומות ומתקנים במסך המעקב.'
-                      : 'לא נמצאו מתקנים התואמים לחיפוש.'}
+                      : 'לא נמצאו מתקנים התואמים לסינון הנבחר.'}
                   </div>
                 ) : (
                   <div className="overflow-x-auto">
@@ -2987,6 +4767,7 @@ export default function App() {
                           const shade1 = getFilterShade(item.filterAlef1);
                           const shade2 = getFilterShade(item.filterAlef2);
                           const diff = Math.abs(shade1.pct - shade2.pct);
+                          const dispTagDays = getDaysUntilDate(item.tagExpiry);
 
                           return (
                             <tr
@@ -3043,10 +4824,7 @@ export default function App() {
                               </td>
                               {/* Comparative Shaded Scale for Filter Alef 1 vs Filter Alef 2 */}
                               <td className="py-3.5 px-4">
-                                <div
-                                  className={`p-2 rounded-xl border space-y-1.5 ${saasPanelInset}`}
-                                >
-                                  {/* Bar 1: Filter Alef 1 */}
+                                <div className={`p-2 rounded-xl border space-y-1.5 ${saasPanelInset}`}>
                                   <div className="flex items-center gap-2">
                                     <span className="text-[10px] font-bold opacity-70 w-6 shrink-0">
                                       א׳1
@@ -3068,7 +4846,6 @@ export default function App() {
                                     </span>
                                   </div>
 
-                                  {/* Bar 2: Filter Alef 2 */}
                                   <div className="flex items-center gap-2">
                                     <span className="text-[10px] font-bold opacity-70 w-6 shrink-0">
                                       א׳2
@@ -3090,7 +4867,6 @@ export default function App() {
                                     </span>
                                   </div>
 
-                                  {/* Delta Comparison Footer */}
                                   <div className="flex items-center justify-between text-[10px] pt-0.5 border-t border-slate-200/70 dark:border-slate-800 opacity-75">
                                     <span>הפרש:</span>
                                     <span className="font-mono font-bold tabular-nums">
@@ -3106,7 +4882,17 @@ export default function App() {
                                 </span>
                               </td>
                               <td className="py-3.5 px-4 font-mono tabular-nums">
-                                {item.tagExpiry ? formatDateIL(item.tagExpiry) : '-'}
+                                <span
+                                  className={
+                                    dispTagDays !== null && dispTagDays < 0
+                                      ? 'text-rose-600 dark:text-rose-400 font-bold'
+                                      : dispTagDays !== null && dispTagDays <= 30
+                                      ? 'text-amber-600 dark:text-amber-400 font-bold'
+                                      : ''
+                                  }
+                                >
+                                  {item.tagExpiry ? formatDateIL(item.tagExpiry) : '-'}
+                                </span>
                               </td>
                               <td className="py-3.5 px-4">
                                 <div className="space-y-0.5">
@@ -3186,7 +4972,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Quick Dispenser Selector when multiple dispensers exist */}
                 {allDispensers.length > 1 && (
                   <div className="mb-5">
                     <label className="block text-xs font-semibold opacity-70 mb-1.5">
@@ -3322,14 +5107,16 @@ export default function App() {
                 <div className="flex items-center justify-between pb-4 border-b dark:border-slate-800">
                   <h2 className="text-base sm:text-lg font-bold flex items-center gap-2">
                     <FileSpreadsheet size={20} className="text-emerald-600 dark:text-emerald-400" />
-                    גיבוי וייבוא נתונים (Excel)
+                    גיבוי, דוחות וייבוא נתונים
                   </h2>
                   <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-md bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
-                    XLSX / XLS
+                    XLSX / PDF
                   </span>
                 </div>
 
-                <div className={`p-4 rounded-xl border text-xs leading-relaxed space-y-1.5 ${saasPanelInset}`}>
+                <div
+                  className={`p-4 rounded-xl border text-xs leading-relaxed space-y-1.5 ${saasPanelInset}`}
+                >
                   <p className="font-bold text-slate-800 dark:text-slate-100">
                     מנגנון מיזוג חכם ללא דריסה וללא כפילויות:
                   </p>
@@ -3341,19 +5128,19 @@ export default function App() {
                       ייבוא קובץ גיבוי <strong>אינו דורס</strong> אזורים או מתקנים קיימים במערכת.
                     </li>
                     <li>
-                      אזורים, מקומות, רענונים ופעולות שכבר קיימים מזוהים אוטומטית ואינם מוכפלים.
+                      ניתן להפיק בכל רגע <strong>דוח ביקורת רשמי להדפסה / PDF</strong> של כל המערכת.
                     </li>
                   </ul>
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1">
                   <button
                     onClick={handleExportExcelBackup}
                     disabled={isBackupBusy}
                     className="py-3 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs font-bold flex items-center justify-center gap-2 shadow-sm transition cursor-pointer"
                   >
                     <Download size={16} />
-                    <span>ייצוא קובץ גיבוי Excel</span>
+                    <span>ייצוא Excel</span>
                   </button>
 
                   <button
@@ -3366,7 +5153,15 @@ export default function App() {
                     }`}
                   >
                     <Upload size={16} className="text-indigo-600 dark:text-indigo-400" />
-                    <span>ייבוא קובץ גיבוי (מיזוג בטוח)</span>
+                    <span>ייבוא Excel</span>
+                  </button>
+
+                  <button
+                    onClick={() => setShowReportModal(true)}
+                    className="py-3 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold flex items-center justify-center gap-2 shadow-sm transition cursor-pointer"
+                  >
+                    <Printer size={16} />
+                    <span>הפק דוח PDF</span>
                   </button>
                 </div>
               </div>
