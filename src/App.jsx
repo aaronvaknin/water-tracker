@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import {
   Building2,
   MapPin,
@@ -53,11 +53,11 @@ import {
  * - Persistent SaaS Sidebar Navigation + Sticky Glassmorphic Top Bar
  * - Smart Action Center (מרכז התראות ודברים דחופים) for expired/expiring tags, <20% filters, & faults
  * - Quick Technician & Escort Name History chips inside Filter Renewal modal
- * - Zero-dependency Offline QR Code Label Generator & Deep-Linking per Dispenser
- * - Official A4 Printable / PDF Inspection Report (דוח ביקורת רשמי להדפסה / PDF)
+ * - Zero-dependency Offline QR Code Label Generator (ISO/IEC 18004) & Deep-Linking per Dispenser
+ * - Official A4 Printable / PDF Inspection Report (multi-page print-safe layout)
  * - Advanced Dashboard Filtering (Faulty / Expired / Area) & Sorting (Lowest Filter % / Nearest Expiry)
  * - Mobile Camera Capture & Offline Compressed Photo Documentation per Dispenser
- * - Native Excel (.xlsx) Export & Non-Destructive Deduplicated Import Backup
+ * - Native Excel (.xlsx) Export, UTF-8 CSV & Sparse SpreadsheetML Fallback + Deduplicated Import
  */
 
 const STORAGE_KEY = 'aquaops_water_tracker_v3_state';
@@ -71,14 +71,25 @@ const getLocalIsoDate = (dateObj = new Date()) => {
   return `${year}-${month}-${day}`;
 };
 
-// Helper: Safely parse YYYY-MM-DD in local time
+// Helper: Safely parse YYYY-MM-DD in local time and reject calendar overflow (e.g. Feb 31)
 const parseLocalIsoDate = (isoDate) => {
   if (!isoDate || typeof isoDate !== 'string') return null;
-  const parts = isoDate.split('-').map(Number);
-  if (parts.length !== 3 || parts.some(isNaN)) return null;
-  const [year, month, day] = parts;
+  const match = isoDate.trim().match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
   const parsed = new Date(year, month - 1, day);
-  return isNaN(parsed.getTime()) ? null : parsed;
+  if (
+    isNaN(parsed.getTime()) ||
+    parsed.getFullYear() !== year ||
+    parsed.getMonth() !== month - 1 ||
+    parsed.getDate() !== day
+  ) {
+    return null;
+  }
+  return parsed;
 };
 
 // Helper: Calculate days from today to a YYYY-MM-DD date string
@@ -88,6 +99,22 @@ const getDaysUntilDate = (isoDate) => {
   const now = new Date();
   const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   return Math.round((target.getTime() - todayMidnight.getTime()) / (1000 * 60 * 60 * 24));
+};
+
+// Helper: Format ISO YYYY-MM-DD to DD/MM/YYYY
+const formatDateIL = (isoDate) => {
+  if (!isoDate) return '';
+  const parts = String(isoDate).split('-');
+  if (parts.length !== 3) return String(isoDate);
+  return `${parts[2]}/${parts[1]}/${parts[0]}`;
+};
+
+// Helper: Safely normalize percentage values (treats empty/null cells as fallback instead of 0)
+const toPercent = (val, fallback = 100) => {
+  if (val === null || val === undefined || String(val).trim() === '') return fallback;
+  const cleaned = String(val).replace('%', '').trim();
+  const parsed = Number(cleaned);
+  return isNaN(parsed) ? fallback : Math.max(0, Math.min(100, Math.round(parsed)));
 };
 
 // Helper: Normalize various date representations (Excel serial, DD/MM/YYYY, YYYY-MM-DD, Date) to YYYY-MM-DD
@@ -103,25 +130,28 @@ const normalizeImportedDate = (rawVal) => {
     const year = d.getUTCFullYear();
     const month = String(d.getUTCMonth() + 1).padStart(2, '0');
     const day = String(d.getUTCDate()).padStart(2, '0');
-    return `${year}-${month}-${day}`;
+    const candidate = `${year}-${month}-${day}`;
+    return parseLocalIsoDate(candidate) ? candidate : '';
   }
   const str = String(rawVal).trim();
   if (!str || str === '-' || str === 'טרם בוצע' || str === '__/__/____') return '';
 
   const isoMatch = str.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/);
   if (isoMatch) {
-    return `${isoMatch[1]}-${isoMatch[2].padStart(2, '0')}-${isoMatch[3].padStart(2, '0')}`;
+    const candidate = `${isoMatch[1]}-${isoMatch[2].padStart(2, '0')}-${isoMatch[3].padStart(2, '0')}`;
+    return parseLocalIsoDate(candidate) ? candidate : '';
   }
 
   const ilMatch = str.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})/);
   if (ilMatch) {
-    return `${ilMatch[3]}-${ilMatch[2].padStart(2, '0')}-${ilMatch[1].padStart(2, '0')}`;
+    const candidate = `${ilMatch[3]}-${ilMatch[2].padStart(2, '0')}-${ilMatch[1].padStart(2, '0')}`;
+    return parseLocalIsoDate(candidate) ? candidate : '';
   }
 
   return '';
 };
 
-// Helper: Dynamically load SheetJS (XLSX) library on demand for native .xlsx creation & parsing
+// Helper: Dynamically load SheetJS (XLSX) library on demand with clean error recovery
 const loadXLSXLibrary = () => {
   return new Promise((resolve, reject) => {
     if (typeof window !== 'undefined' && window.XLSX) {
@@ -130,18 +160,43 @@ const loadXLSXLibrary = () => {
     }
     const existingScript = document.querySelector(`script[src="${SHEETJS_CDN_URL}"]`);
     if (existingScript) {
-      existingScript.addEventListener('load', () => resolve(window.XLSX));
-      existingScript.addEventListener('error', () => reject(new Error('XLSX load failed')));
-      return;
+      if (existingScript.dataset.status === 'loaded' && window.XLSX) {
+        resolve(window.XLSX);
+        return;
+      }
+      if (existingScript.dataset.status === 'error') {
+        existingScript.remove();
+      } else {
+        existingScript.addEventListener(
+          'load',
+          () => {
+            if (window.XLSX) resolve(window.XLSX);
+            else reject(new Error('XLSX global unavailable'));
+          },
+          { once: true }
+        );
+        existingScript.addEventListener('error', () => reject(new Error('XLSX load failed')), {
+          once: true
+        });
+        return;
+      }
     }
     const script = document.createElement('script');
     script.src = SHEETJS_CDN_URL;
     script.async = true;
     script.onload = () => {
+      script.dataset.status = 'loaded';
       if (window.XLSX) resolve(window.XLSX);
-      else reject(new Error('XLSX global unavailable'));
+      else {
+        script.remove();
+        reject(new Error('XLSX global unavailable'));
+      }
     };
-    script.onerror = () => reject(new Error('XLSX CDN unreachable'));
+    script.onerror = () => {
+      script.dataset.status = 'error';
+      script.remove();
+      reject(new Error('XLSX CDN unreachable'));
+    };
     document.head.appendChild(script);
   });
 };
@@ -171,6 +226,11 @@ const compressImageFile = (file, maxDimension = 800, quality = 0.66) => {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (event) => {
+      const result = event.target?.result;
+      if (typeof result !== 'string') {
+        reject(new Error('Invalid image data'));
+        return;
+      }
       const img = new Image();
       img.onload = () => {
         let { width, height } = img;
@@ -198,7 +258,7 @@ const compressImageFile = (file, maxDimension = 800, quality = 0.66) => {
         resolve(compressedDataUrl);
       };
       img.onerror = () => reject(new Error('Image decode failed'));
-      img.src = event.target?.result;
+      img.src = result;
     };
     reader.onerror = () => reject(new Error('File read failed'));
     reader.readAsDataURL(file);
@@ -269,6 +329,7 @@ const computeReedSolomonEC = (dataBytes, ecCount) => {
 };
 
 const generateQrMatrix = (text) => {
+  if (!text || typeof text !== 'string') return null;
   const bytes = new TextEncoder().encode(text);
   let version = 1;
   while (version <= 10) {
@@ -428,7 +489,7 @@ const generateQrMatrix = (text) => {
     upward = !upward;
   }
 
-  // Evaluate mask patterns 0..7 & select optimal mask
+  // Evaluate mask patterns 0..7 & place format info (ISO/IEC 18004 MSB->LSB order)
   const applyMaskAndFormat = (grid, maskId) => {
     for (let r = 0; r < N; r++) {
       for (let c = 0; c < N; c++) {
@@ -465,18 +526,20 @@ const generateQrMatrix = (text) => {
         if (invert) grid[r][c] = !grid[r][c];
       }
     }
-    const fmt = QR_FORMAT_BITS_L[maskId];
-    for (let i = 0; i <= 5; i++) grid[8][i] = Boolean((fmt >> i) & 1);
-    grid[8][7] = Boolean((fmt >> 6) & 1);
-    grid[8][8] = Boolean((fmt >> 7) & 1);
-    grid[7][8] = Boolean((fmt >> 8) & 1);
-    for (let i = 9; i <= 14; i++) grid[14 - i][8] = Boolean((fmt >> i) & 1);
 
-    for (let i = 0; i <= 6; i++) grid[N - 1 - i][8] = Boolean((fmt >> i) & 1);
-    for (let i = 7; i <= 14; i++) grid[8][N - 15 + i] = Boolean((fmt >> i) & 1);
+    const fmt = QR_FORMAT_BITS_L[maskId];
+    // Top-left copy: bit 14 (MSB) at (8,0) .. bit 0 (LSB) at (0,8)
+    for (let i = 0; i < 6; i++) grid[8][i] = Boolean((fmt >> (14 - i)) & 1);
+    grid[8][7] = Boolean((fmt >> 8) & 1);
+    grid[8][8] = Boolean((fmt >> 7) & 1);
+    grid[7][8] = Boolean((fmt >> 6) & 1);
+    for (let i = 0; i < 6; i++) grid[5 - i][8] = Boolean((fmt >> (5 - i)) & 1);
+
+    // Bottom-left & top-right split copy
+    for (let i = 0; i < 7; i++) grid[N - 1 - i][8] = Boolean((fmt >> (14 - i)) & 1);
+    for (let i = 0; i < 8; i++) grid[8][N - 8 + i] = Boolean((fmt >> (7 - i)) & 1);
   };
 
-  let bestMask = 0;
   let bestScore = Infinity;
   let bestGrid = null;
 
@@ -530,7 +593,6 @@ const generateQrMatrix = (text) => {
 
     if (score < bestScore) {
       bestScore = score;
-      bestMask = m;
       bestGrid = candidate;
     }
   }
@@ -541,7 +603,13 @@ const generateQrMatrix = (text) => {
 // Reusable SVG QR Code Renderer Component
 const QrCodeSvg = ({ value, size = 210 }) => {
   const matrix = useMemo(() => generateQrMatrix(value), [value]);
-  if (!matrix) return null;
+  if (!matrix) {
+    return (
+      <div className="p-4 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs font-semibold">
+        כתובת המתקן ארוכה מדי עבור קוד QR (מקסימום 271 בתים בקידוד UTF-8).
+      </div>
+    );
+  }
   const n = matrix.length;
   const quietZone = 4;
   const total = n + quietZone * 2;
@@ -669,8 +737,20 @@ export default function App() {
   const [toast, setToast] = useState(null);
   const toastTimerRef = useRef(null);
 
-  // Ref to coalesce rapid slider/typing audit logs for the same location & field
+  // Guard refs
   const lastLogMetaRef = useRef({ key: '', timestamp: 0 });
+  const qrHandledRef = useRef(false);
+  const storageWarnedRef = useRef(false);
+
+  // Display non-intrusive SaaS toast notification without overlapping timers
+  const notify = useCallback((message, duration = 3500) => {
+    setToast(message);
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => {
+      setToast(null);
+      toastTimerRef.current = null;
+    }, duration);
+  }, []);
 
   // Sync `.dark` class on <html>
   useEffect(() => {
@@ -684,7 +764,7 @@ export default function App() {
     }
   }, [darkMode]);
 
-  // Persist application state automatically to localStorage
+  // Persist application state automatically to localStorage with storage quota warning
   useEffect(() => {
     try {
       const payload = {
@@ -698,8 +778,15 @@ export default function App() {
         selectedLocationId
       };
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+      storageWarnedRef.current = false;
     } catch {
-      // Ignore storage quota or private-browsing errors gracefully
+      if (!storageWarnedRef.current) {
+        storageWarnedRef.current = true;
+        notify(
+          'שגיאה בשמירה המקומית: נפח האחסון בדפדפן מלא (ייתכן מעודף תמונות). בצע ייצוא Excel ומחק תמונות ישנות.',
+          6000
+        );
+      }
     }
   }, [
     darkMode,
@@ -709,7 +796,8 @@ export default function App() {
     savedTechnicians,
     savedEscorts,
     selectedAreaId,
-    selectedLocationId
+    selectedLocationId,
+    notify
   ]);
 
   // Clean up toast timer on unmount
@@ -719,16 +807,23 @@ export default function App() {
     };
   }, []);
 
-  // QR Code Deep-Linking Handler: Automatically open specific Area & Dispenser when scanned via URL query
+  // QR Code Deep-Linking Handler: Runs once on mount if query params exist
   useEffect(() => {
-    const handleQrUrlNavigation = () => {
-      try {
-        const params = new URLSearchParams(window.location.search);
-        const qrAreaParam = params.get('area');
-        const qrLocParam = params.get('loc');
-        if (!qrAreaParam && !qrLocParam) return;
-        if (areas.length === 0) return;
+    if (qrHandledRef.current) return;
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const qrAreaParam = params.get('area');
+      const qrLocParam = params.get('loc');
+      if (!qrAreaParam && !qrLocParam) {
+        qrHandledRef.current = true;
+        return;
+      }
 
+      qrHandledRef.current = true;
+
+      if (areas.length === 0) {
+        notify('לא נמצאו מתקנים שמורים במכשיר זה לפתיחת קוד ה-QR', 4500);
+      } else {
         let matchedArea = areas.find(
           (a) =>
             String(a.id) === qrAreaParam ||
@@ -762,18 +857,20 @@ export default function App() {
             `נפתח מתקן מסריקת QR: ${matchedLoc ? matchedLoc.dispenserName : matchedArea.name}`,
             4200
           );
+        } else {
+          notify('המתקן בקוד ה-QR לא נמצא במכשיר זה', 4200);
         }
-
-        // Clean query string cleanly so subsequent refreshes behave normally
-        const cleanUrl = `${window.location.origin}${window.location.pathname}`;
-        window.history.replaceState({}, document.title, cleanUrl);
-      } catch {
-        // Ignore URL parsing errors
       }
-    };
 
-    handleQrUrlNavigation();
-  }, [areas]);
+      // Clean query string safely across http/https/file protocols
+      const url = new URL(window.location.href);
+      url.searchParams.delete('area');
+      url.searchParams.delete('loc');
+      window.history.replaceState({}, document.title, url.toString());
+    } catch {
+      qrHandledRef.current = true;
+    }
+  }, [areas, notify]);
 
   // Keep active selection valid when items are added or deleted
   useEffect(() => {
@@ -796,23 +893,12 @@ export default function App() {
     }
   }, [areas, selectedAreaId, selectedLocationId]);
 
-  // Display non-intrusive SaaS toast notification without overlapping timers
-  const notify = (message, duration = 3500) => {
-    setToast(message);
-    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-    toastTimerRef.current = setTimeout(() => {
-      setToast(null);
-      toastTimerRef.current = null;
-    }, duration);
-  };
-
-  // Format ISO YYYY-MM-DD to DD/MM/YYYY
-  const formatDateIL = (isoDate) => {
-    if (!isoDate) return '';
-    const parts = isoDate.split('-');
-    if (parts.length !== 3) return isoDate;
-    return `${parts[2]}/${parts[1]}/${parts[0]}`;
-  };
+  // Reset dashboard area filter if the selected area was deleted
+  useEffect(() => {
+    if (dashboardAreaFilter !== 'all' && !areas.some((a) => a.id === dashboardAreaFilter)) {
+      setDashboardAreaFilter('all');
+    }
+  }, [areas, dashboardAreaFilter]);
 
   // Generate current local ISO date and formatted Hebrew timestamp
   const getNowStrings = () => {
@@ -924,7 +1010,7 @@ export default function App() {
   // Flattened inventory across all areas
   const allDispensers = useMemo(() => {
     return areas.flatMap((area) =>
-      area.locations.map((loc) => ({
+      (area.locations || []).map((loc) => ({
         ...loc,
         areaId: area.id,
         areaName: area.name
@@ -932,7 +1018,7 @@ export default function App() {
     );
   }, [areas]);
 
-  // Combined Unique History of Technicians & Escorts (from both persistent list & all renewal records)
+  // Combined Unique History of Technicians & Escorts
   const technicianHistoryList = useMemo(() => {
     const set = new Set(savedTechnicians.map((n) => n.trim()).filter(Boolean));
     allDispensers.forEach((d) => {
@@ -972,6 +1058,8 @@ export default function App() {
       const diffTank = item.tankTagExpiry ? getDaysUntilDate(item.tankTagExpiry) : null;
       const dispNeedsAlert = diffDisp !== null && diffDisp <= 30;
       const tankNeedsAlert = diffTank !== null && diffTank <= 30;
+      const pct1 = toPercent(item.filterAlef1, 100);
+      const pct2 = toPercent(item.filterAlef2, 100);
 
       // 1 & 2. Dispenser & Tank Tag Expiry (combined when both have the exact same expiry date)
       if (dispNeedsAlert && tankNeedsAlert && item.tagExpiry === item.tankTagExpiry) {
@@ -1068,7 +1156,7 @@ export default function App() {
       }
 
       // 3. Filter Alef 1 or Filter Alef 2 below 20%
-      if (Number(item.filterAlef1) < 20) {
+      if (pct1 < 20) {
         pushUniqueAlert({
           id: `${item.id}-alef1-low`,
           areaId: item.areaId,
@@ -1077,11 +1165,11 @@ export default function App() {
           locationName: item.name,
           dispenserName: item.dispenserName,
           category: 'filter_low',
-          severity: Number(item.filterAlef1) <= 10 ? 'critical' : 'warning',
-          message: `פילטר אלף 1 ירד ל-${item.filterAlef1}% (מתחת ל-20%)`
+          severity: pct1 <= 10 ? 'critical' : 'warning',
+          message: `פילטר אלף 1 ירד ל-${pct1}% (מתחת ל-20%)`
         });
       }
-      if (Number(item.filterAlef2) < 20) {
+      if (pct2 < 20) {
         pushUniqueAlert({
           id: `${item.id}-alef2-low`,
           areaId: item.areaId,
@@ -1090,8 +1178,8 @@ export default function App() {
           locationName: item.name,
           dispenserName: item.dispenserName,
           category: 'filter_low',
-          severity: Number(item.filterAlef2) <= 10 ? 'critical' : 'warning',
-          message: `פילטר אלף 2 ירד ל-${item.filterAlef2}% (מתחת ל-20%)`
+          severity: pct2 <= 10 ? 'critical' : 'warning',
+          message: `פילטר אלף 2 ירד ל-${pct2}% (מתחת ל-20%)`
         });
       }
 
@@ -1140,28 +1228,25 @@ export default function App() {
 
   // Helper: Overall location health indicator
   const isLocationHealthy = (loc) =>
-    loc.filterMaga === 'תקין' &&
-    loc.tankSensitivity === 'תקין' &&
-    Number(loc.filterAlef1) >= 20 &&
-    Number(loc.filterAlef2) >= 20;
+    (loc.filterMaga || 'תקין') === 'תקין' &&
+    (loc.tankSensitivity || 'תקין') === 'תקין' &&
+    toPercent(loc.filterAlef1, 100) >= 20 &&
+    toPercent(loc.filterAlef2, 100) >= 20;
 
   // Advanced Filtered & Sorted Dispensers for Dashboard
   const filteredDispensers = useMemo(() => {
     let list = [...allDispensers];
 
-    // 1. Area filter
     if (dashboardAreaFilter !== 'all') {
       list = list.filter((item) => item.areaId === dashboardAreaFilter);
     }
 
-    // 2. Status quick filter ('all' | 'faulty' | 'expired')
     if (dashboardStatusFilter === 'faulty') {
       list = list.filter((item) => !isLocationHealthy(item));
     } else if (dashboardStatusFilter === 'expired') {
       list = list.filter((item) => hasExpiredOrExpiringTag(item));
     }
 
-    // 3. Text search
     if (dashboardSearch.trim()) {
       const q = dashboardSearch.trim().toLowerCase();
       list = list.filter(
@@ -1174,11 +1259,10 @@ export default function App() {
       );
     }
 
-    // 4. Sorting ('default' | 'lowest_filter' | 'nearest_expiry')
     if (dashboardSortBy === 'lowest_filter') {
       list.sort((a, b) => {
-        const minA = Math.min(Number(a.filterAlef1 ?? 100), Number(a.filterAlef2 ?? 100));
-        const minB = Math.min(Number(b.filterAlef1 ?? 100), Number(b.filterAlef2 ?? 100));
+        const minA = Math.min(toPercent(a.filterAlef1, 100), toPercent(a.filterAlef2, 100));
+        const minB = Math.min(toPercent(b.filterAlef1, 100), toPercent(b.filterAlef2, 100));
         return minA - minB;
       });
     } else if (dashboardSortBy === 'nearest_expiry') {
@@ -1206,13 +1290,22 @@ export default function App() {
   const headerTableUpdateDate = currentLocation?.lastTableUpdateDate || lastGlobalUpdateDate;
   const todayLocalIso = getLocalIsoDate();
 
-  // QR Deep Link URL for current dispenser
+  // QR Deep Link URL for current dispenser (safe across http/https/file)
   const currentDispenserQrUrl = useMemo(() => {
     if (!currentArea || !currentLocation || typeof window === 'undefined') return '';
-    const baseUrl = `${window.location.origin}${window.location.pathname}`;
-    return `${baseUrl}?area=${encodeURIComponent(currentArea.id)}&loc=${encodeURIComponent(
-      currentLocation.id
-    )}`;
+    try {
+      const url = new URL(window.location.href);
+      url.search = '';
+      url.hash = '';
+      url.searchParams.set('area', currentArea.id);
+      url.searchParams.set('loc', currentLocation.id);
+      return url.toString();
+    } catch {
+      const baseUrl = `${window.location.origin || ''}${window.location.pathname || ''}`;
+      return `${baseUrl}?area=${encodeURIComponent(currentArea.id)}&loc=${encodeURIComponent(
+        currentLocation.id
+      )}`;
+    }
   }, [currentArea, currentLocation]);
 
   // =========================================================================
@@ -1311,7 +1404,10 @@ export default function App() {
   const handleDownloadQrPng = () => {
     if (!currentLocation || !currentArea || !currentDispenserQrUrl) return;
     const matrix = generateQrMatrix(currentDispenserQrUrl);
-    if (!matrix) return;
+    if (!matrix) {
+      notify('לא ניתן ליצור תווית PNG: כתובת הקישור ארוכה מדי לקוד QR');
+      return;
+    }
 
     const n = matrix.length;
     const scale = 10;
@@ -1325,11 +1421,9 @@ export default function App() {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // White background
     ctx.fillStyle = '#FFFFFF';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    // Draw QR modules
     ctx.fillStyle = '#0F172A';
     for (let r = 0; r < n; r++) {
       for (let c = 0; c < n; c++) {
@@ -1339,7 +1433,6 @@ export default function App() {
       }
     }
 
-    // Divider line
     ctx.strokeStyle = '#E2E8F0';
     ctx.lineWidth = 2;
     ctx.beginPath();
@@ -1347,28 +1440,39 @@ export default function App() {
     ctx.lineTo(canvas.width - 20, qrPixelSize + 6);
     ctx.stroke();
 
-    // Hebrew Label Footer
+    const maxLabelWidth = canvas.width - 24;
+    if ('direction' in ctx) ctx.direction = 'rtl';
     ctx.textAlign = 'center';
+
     ctx.fillStyle = '#0F172A';
     ctx.font = 'bold 18px sans-serif';
-    ctx.fillText(currentLocation.dispenserName, canvas.width / 2, qrPixelSize + 34);
+    ctx.fillText(currentLocation.dispenserName || '', canvas.width / 2, qrPixelSize + 34, maxLabelWidth);
 
     ctx.fillStyle = '#475569';
     ctx.font = '14px sans-serif';
     ctx.fillText(
       `אזור: ${currentArea.name} | מקום: ${currentLocation.name}`,
       canvas.width / 2,
-      qrPixelSize + 58
+      qrPixelSize + 58,
+      maxLabelWidth
     );
 
     ctx.fillStyle = '#4F46E5';
     ctx.font = 'bold 11px sans-serif';
-    ctx.fillText('AquaOps PRO • סרוק לפתיחת כרטיס מתקן', canvas.width / 2, qrPixelSize + 80);
+    ctx.fillText(
+      'AquaOps PRO • סרוק לפתיחת כרטיס מתקן',
+      canvas.width / 2,
+      qrPixelSize + 80,
+      maxLabelWidth
+    );
 
+    const safeFilePart = (str) => String(str || '').replace(/[\\/:*?"<>|]/g, '_');
     const url = canvas.toDataURL('image/png');
     const a = document.createElement('a');
     a.href = url;
-    a.download = `QR_${currentArea.name}_${currentLocation.dispenserName}.png`;
+    a.download = `QR_${safeFilePart(currentArea.name)}_${safeFilePart(
+      currentLocation.dispenserName
+    )}.png`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -1415,8 +1519,8 @@ export default function App() {
           שם_מקום: loc.name,
           שם_מתקן: loc.dispenserName || '',
           פילטר_מגה: loc.filterMaga || 'תקין',
-          פילטר_אלף_1: Number(loc.filterAlef1 ?? 100),
-          פילטר_אלף_2: Number(loc.filterAlef2 ?? 100),
+          פילטר_אלף_1: toPercent(loc.filterAlef1, 100),
+          פילטר_אלף_2: toPercent(loc.filterAlef2, 100),
           תוקף_תג_מתקן: loc.tagExpiry || '',
           סוג_שעון: loc.clockType || 'דיגיטלי',
           סוג_מערכת: loc.systemType || 'טורי',
@@ -1571,7 +1675,7 @@ export default function App() {
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-      notify('קובץ גיבוי Excel יוצא בהצלחה!');
+      notify('קובץ גיבוי Excel (.xls אופליין) יוצא בהצלחה!');
     } finally {
       setActionHistory((prev) => [
         {
@@ -1586,6 +1690,7 @@ export default function App() {
     }
   };
 
+  // SpreadsheetML parser with full ss:Index support for sparse/empty XML cells
   const parseSpreadsheetMLFallback = (xmlText) => {
     const parser = new DOMParser();
     const doc = parser.parseFromString(xmlText, 'application/xml');
@@ -1599,11 +1704,30 @@ export default function App() {
         result[name] = [];
         return;
       }
-      const getRowValues = (rowEl) =>
-        Array.from(rowEl.getElementsByTagName('Cell')).map((cell) => {
+
+      const getRowValues = (rowEl) => {
+        const vals = [];
+        let colIdx = 0;
+        Array.from(rowEl.getElementsByTagName('Cell')).forEach((cell) => {
+          const ssIndexRaw =
+            cell.getAttribute('ss:Index') ||
+            cell.getAttributeNS('urn:schemas-microsoft-com:office:spreadsheet', 'Index') ||
+            cell.getAttribute('Index');
+          if (ssIndexRaw) {
+            const targetIdx = Number(ssIndexRaw) - 1;
+            if (!isNaN(targetIdx)) {
+              while (colIdx < targetIdx) {
+                vals.push('');
+                colIdx += 1;
+              }
+            }
+          }
           const dataEl = cell.getElementsByTagName('Data')[0];
-          return dataEl ? dataEl.textContent || '' : '';
+          vals.push(dataEl ? dataEl.textContent || '' : '');
+          colIdx += 1;
         });
+        return vals;
+      };
 
       const headers = getRowValues(rows[0]);
       result[name] = rows.slice(1).map((r) => {
@@ -1624,10 +1748,11 @@ export default function App() {
     let addedLocationsCount = 0;
     let addedRenewalsCount = 0;
     let skippedDuplicatesCount = 0;
+    let latestImportedDate = lastGlobalUpdateDate;
 
     const mergedAreas = areas.map((area) => ({
       ...area,
-      locations: area.locations.map((loc) => ({
+      locations: (area.locations || []).map((loc) => ({
         ...loc,
         photos: [...(loc.photos || [])],
         filterRefreshHistory: [...(loc.filterRefreshHistory || [])]
@@ -1670,7 +1795,7 @@ export default function App() {
 
       let targetArea = findMatchingArea(rawAreaId, rawAreaName);
       if (!targetArea) {
-        let newAreaId =
+        const newAreaId =
           rawAreaId && !usedAreaIds.has(rawAreaId)
             ? rawAreaId
             : `area-imp-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 6)}`;
@@ -1694,14 +1819,18 @@ export default function App() {
         return;
       }
 
-      let newLocId =
+      const newLocId =
         rawLocId && !usedLocationIds.has(rawLocId)
           ? rawLocId
           : `loc-imp-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 6)}`;
       usedLocationIds.add(newLocId);
 
-      const rawAlef1 = Number(row['פילטר_אלף_1'] ?? row.filterAlef1);
-      const rawAlef2 = Number(row['פילטר_אלף_2'] ?? row.filterAlef2);
+      const importedUpdateDate = normalizeImportedDate(
+        row['תאריך_עדכון_טבלה'] ?? row.lastTableUpdateDate
+      );
+      if (importedUpdateDate && (!latestImportedDate || importedUpdateDate > latestImportedDate)) {
+        latestImportedDate = importedUpdateDate;
+      }
 
       targetArea.locations.push({
         id: newLocId,
@@ -1712,8 +1841,8 @@ export default function App() {
           String(row['פילטר_מגה'] ?? row.filterMaga ?? '').trim() === 'לא תקין'
             ? 'לא תקין'
             : 'תקין',
-        filterAlef1: isNaN(rawAlef1) ? 100 : Math.max(0, Math.min(100, Math.round(rawAlef1))),
-        filterAlef2: isNaN(rawAlef2) ? 100 : Math.max(0, Math.min(100, Math.round(rawAlef2))),
+        filterAlef1: toPercent(row['פילטר_אלף_1'] ?? row.filterAlef1, 100),
+        filterAlef2: toPercent(row['פילטר_אלף_2'] ?? row.filterAlef2, 100),
         tagExpiry: normalizeImportedDate(row['תוקף_תג_מתקן'] ?? row.tagExpiry),
         clockType: ['דיגיטלי', 'אנלוגי', 'מכני'].includes(
           String(row['סוג_שעון'] ?? row.clockType ?? '').trim()
@@ -1724,9 +1853,7 @@ export default function App() {
           String(row['סוג_מערכת'] ?? row.systemType ?? '').trim() === 'מקבילי'
             ? 'מקבילי'
             : 'טורי',
-        lastTableUpdateDate: normalizeImportedDate(
-          row['תאריך_עדכון_טבלה'] ?? row.lastTableUpdateDate
-        ),
+        lastTableUpdateDate: importedUpdateDate,
         lastFilterRefreshDate: normalizeImportedDate(
           row['תאריך_רענון_אחרון'] ?? row.lastFilterRefreshDate
         ),
@@ -1812,9 +1939,10 @@ export default function App() {
 
     const mergedHistory = [...actionHistory];
     const existingLogSignatures = new Set(
-      mergedHistory.map((log) => `${log.date}|${log.description.trim()}`)
+      mergedHistory.map((log) => `${log.date}|${String(log.description || '').trim()}`)
     );
     const existingLogIds = new Set(mergedHistory.map((log) => String(log.id)));
+    let addedLogsCount = 0;
 
     historyRows.forEach((row, index) => {
       const logId = String(row['מזהה_פעולה'] ?? row.id ?? '').trim();
@@ -1836,7 +1964,19 @@ export default function App() {
         user: logUser,
         description: logDesc
       });
+      addedLogsCount += 1;
     });
+
+    if (
+      addedAreasCount === 0 &&
+      addedLocationsCount === 0 &&
+      addedRenewalsCount === 0 &&
+      addedLogsCount === 0 &&
+      skippedDuplicatesCount === 0
+    ) {
+      notify('לא נמצאו שורות תקינות לייבוא בקובץ (ודא שקיימת עמודת שם_אזור).', 4500);
+      return;
+    }
 
     const { fullDateTime } = getNowStrings();
     const summaryLog = {
@@ -1847,6 +1987,7 @@ export default function App() {
     };
 
     setAreas(mergedAreas);
+    if (latestImportedDate) setLastGlobalUpdateDate(latestImportedDate);
     setActionHistory([summaryLog, ...mergedHistory]);
 
     if (!selectedAreaId && mergedAreas.length > 0) {
@@ -1899,7 +2040,7 @@ export default function App() {
         return;
       }
 
-      const headSnippet = await file.slice(0, 200).text();
+      const headSnippet = await file.slice(0, 250).text();
       if (headSnippet.includes('schemas-microsoft-com:office:spreadsheet')) {
         const fullXml = await file.text();
         const sheets = parseSpreadsheetMLFallback(fullXml);
@@ -1912,8 +2053,14 @@ export default function App() {
       }
 
       const XLSX = await loadXLSXLibrary();
-      const buffer = await file.arrayBuffer();
-      const wb = XLSX.read(buffer, { type: 'array', cellDates: true });
+      let wb;
+      if (lowerName.endsWith('.csv')) {
+        const csvText = (await file.text()).replace(/^\uFEFF/, '');
+        wb = XLSX.read(csvText, { type: 'string', cellDates: true });
+      } else {
+        const buffer = await file.arrayBuffer();
+        wb = XLSX.read(buffer, { type: 'array', cellDates: true });
+      }
 
       const firstSheetName = wb.SheetNames.includes('מתקנים_ומיכלים')
         ? 'מתקנים_ומיכלים'
@@ -1931,7 +2078,7 @@ export default function App() {
 
       mergeImportedDatasets({ dispensersRows, renewalsRows, historyRows });
     } catch {
-      notify('שגיאה בקריאת הקובץ. ודא שמדובר בקובץ גיבוי תקין (.xlsx / .xls).', 4000);
+      notify('שגיאה בקריאת הקובץ. ודא שמדובר בקובץ גיבוי תקין (.xlsx / .xls / .csv / .json).', 4000);
     } finally {
       setIsBackupBusy(false);
       if (fileInputRef.current) {
@@ -1948,8 +2095,7 @@ export default function App() {
 
     let value = rawValue;
     if (field === 'filterAlef1' || field === 'filterAlef2') {
-      const parsed = Number(rawValue);
-      value = Math.max(0, Math.min(100, isNaN(parsed) ? 0 : Math.round(parsed)));
+      value = toPercent(rawValue, 0);
     }
 
     const { todayStr, fullDateTime } = getNowStrings();
@@ -2017,8 +2163,8 @@ export default function App() {
       return;
     }
 
-    if (!renewalDate) {
-      setRenewalError('חובה לבחור תאריך ביצוע רענון.');
+    if (!renewalDate || !parseLocalIsoDate(renewalDate)) {
+      setRenewalError('חובה לבחור תאריך ביצוע רענון תקין.');
       return;
     }
 
@@ -2029,7 +2175,6 @@ export default function App() {
     const recordTimestamp =
       renewalDate === todayStr ? `${formattedRenewalDate} ${timeStr}` : formattedRenewalDate;
 
-    // Persist names to quick-pick history
     setSavedTechnicians((prev) => [cleanTech, ...prev.filter((n) => n.trim() !== cleanTech)]);
     setSavedEscorts((prev) => [cleanEscort, ...prev.filter((n) => n.trim() !== cleanEscort)]);
 
@@ -2099,9 +2244,12 @@ export default function App() {
   // --- AREA CRUD ---
   const handleAddArea = () => {
     const trimmed = newAreaName.trim();
-    if (!trimmed) return;
+    if (!trimmed) {
+      notify('יש להזין שם או מספר אזור');
+      return;
+    }
 
-    const newId = 'area-' + Date.now();
+    const newId = `area-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     const { fullDateTime } = getNowStrings();
 
     setAreas((prev) => [...prev, { id: newId, name: trimmed, locations: [] }]);
@@ -2125,7 +2273,10 @@ export default function App() {
 
   const handleSaveAreaRename = (areaId) => {
     const trimmed = editingAreaNameValue.trim();
-    if (!trimmed) return;
+    if (!trimmed) {
+      notify('שם האזור לא יכול להיות ריק');
+      return;
+    }
 
     const oldArea = areas.find((a) => a.id === areaId);
     const { fullDateTime } = getNowStrings();
@@ -2165,9 +2316,13 @@ export default function App() {
   const handleAddLocation = () => {
     const trimmedLoc = newLocName.trim();
     const trimmedItem = newItemName.trim();
-    if (!selectedAreaId || !trimmedLoc || !trimmedItem) return;
+    if (!selectedAreaId) return;
+    if (!trimmedLoc || !trimmedItem) {
+      notify('יש למלא גם שם מקום וגם שם מתקן מים');
+      return;
+    }
 
-    const newLocId = 'loc-' + Date.now();
+    const newLocId = `loc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     const { todayStr, fullDateTime } = getNowStrings();
 
     setAreas((prev) =>
@@ -2222,7 +2377,10 @@ export default function App() {
 
   const handleSaveLocationRename = (locId) => {
     const trimmed = editingLocationNameValue.trim();
-    if (!trimmed) return;
+    if (!trimmed) {
+      notify('שם המקום לא יכול להיות ריק');
+      return;
+    }
 
     const oldLoc = currentArea?.locations.find((l) => l.id === locId);
     const { fullDateTime } = getNowStrings();
@@ -2348,7 +2506,7 @@ export default function App() {
 
   // Helper: Continuous percentage-based color shade & gradient scale
   const getFilterShade = (pct) => {
-    const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
+    const clamped = toPercent(pct, 100);
     const hue = Math.round((clamped / 100) * 145);
     const startHue = Math.max(0, hue - 22);
     const lightness = darkMode ? 54 : 43;
@@ -2509,38 +2667,54 @@ export default function App() {
   return (
     <div
       dir="rtl"
-      className={`min-h-screen flex font-sans antialiased transition-colors duration-200 ${
+      className={`print-flow min-h-screen flex font-sans antialiased transition-colors duration-200 ${
         darkMode ? 'bg-[#090D16] text-slate-100' : 'bg-[#F8FAFC] text-slate-900'
       }`}
     >
-      {/* Dedicated Print Stylesheet so Official A4 PDF Report prints cleanly */}
-      <style>{`
-        @media print {
-          body * {
-            visibility: hidden !important;
+      {/* Multi-page A4 Print Stylesheet (active only while Report Modal is open) */}
+      {showReportModal && (
+        <style>{`
+          @media print {
+            @page {
+              size: A4 portrait;
+              margin: 12mm;
+            }
+            .no-print {
+              display: none !important;
+            }
+            .print-flow {
+              display: block !important;
+              min-height: auto !important;
+              height: auto !important;
+              background: #ffffff !important;
+              color: #0f172a !important;
+            }
+            .print-reset {
+              position: static !important;
+              inset: auto !important;
+              width: 100% !important;
+              max-width: none !important;
+              max-height: none !important;
+              height: auto !important;
+              overflow: visible !important;
+              background: #ffffff !important;
+              color: #0f172a !important;
+              padding: 0 !important;
+              margin: 0 !important;
+              box-shadow: none !important;
+              border: none !important;
+              border-radius: 0 !important;
+            }
+            #aquaops-printable-report tr {
+              break-inside: avoid;
+              page-break-inside: avoid;
+            }
+            #aquaops-printable-report thead {
+              display: table-header-group;
+            }
           }
-          #aquaops-printable-report,
-          #aquaops-printable-report * {
-            visibility: visible !important;
-          }
-          #aquaops-printable-report {
-            position: fixed !important;
-            inset: 0 !important;
-            width: 100% !important;
-            background: #ffffff !important;
-            color: #0f172a !important;
-            padding: 12mm !important;
-            margin: 0 !important;
-            box-shadow: none !important;
-            border: none !important;
-            overflow: visible !important;
-            z-index: 99999 !important;
-          }
-          .no-print {
-            display: none !important;
-          }
-        }
-      `}</style>
+        `}</style>
+      )}
 
       {/* Hidden File Inputs for Excel Backup & Mobile Camera / Gallery */}
       <input
@@ -2570,7 +2744,7 @@ export default function App() {
       {/* PERSISTENT MODERN SAAS SIDEBAR (Desktop Right Rail)                   */}
       {/* ===================================================================== */}
       <aside
-        className={`hidden lg:flex lg:w-64 xl:w-72 shrink-0 flex-col justify-between border-l sticky top-0 h-screen z-30 ${
+        className={`no-print hidden lg:flex lg:w-64 xl:w-72 shrink-0 flex-col justify-between border-l sticky top-0 h-screen z-30 ${
           darkMode ? 'bg-[#0D1320] border-slate-800/90' : 'bg-white border-slate-200/90'
         }`}
       >
@@ -2737,7 +2911,7 @@ export default function App() {
 
       {/* MOBILE NAVIGATION DRAWER */}
       {mobileMenuOpen && (
-        <div className="fixed inset-0 z-50 lg:hidden flex">
+        <div className="no-print fixed inset-0 z-50 lg:hidden flex">
           <div
             className="fixed inset-0 bg-slate-950/50 backdrop-blur-sm"
             onClick={() => setMobileMenuOpen(false)}
@@ -2843,10 +3017,10 @@ export default function App() {
       {/* ===================================================================== */}
       {/* MAIN SAAS WORKSPACE CONTENT SHELL                                     */}
       {/* ===================================================================== */}
-      <div className="flex-1 flex flex-col min-w-0">
+      <div className="print-flow flex-1 flex flex-col min-w-0">
         {/* Sticky SaaS Top Header Bar */}
         <header
-          className={`sticky top-0 z-20 border-b backdrop-blur-md px-4 sm:px-6 lg:px-8 py-3.5 flex flex-wrap items-center justify-between gap-3 ${
+          className={`no-print sticky top-0 z-20 border-b backdrop-blur-md px-4 sm:px-6 lg:px-8 py-3.5 flex flex-wrap items-center justify-between gap-3 ${
             darkMode
               ? 'bg-[#090D16]/85 border-slate-800/90'
               : 'bg-white/85 border-slate-200/90'
@@ -2899,7 +3073,7 @@ export default function App() {
 
           {/* Top-Left Side: Urgent Alert Counter + Official PDF Report + Excel Backup + Live Date */}
           <div className="flex flex-wrap items-center gap-2">
-            {/* Live Action Center Alert Counter Button (toggles Action Center visibility) */}
+            {/* Live Action Center Alert Counter Button */}
             <button
               onClick={() => {
                 if (activeView !== 'tracker' && activeView !== 'dashboard') {
@@ -2991,7 +3165,7 @@ export default function App() {
 
         {/* SAAS TOAST NOTIFICATION */}
         {toast && (
-          <div className="fixed bottom-5 left-5 z-50 bg-slate-900 dark:bg-slate-800 text-white px-4 py-3 rounded-xl shadow-xl border border-slate-700/80 flex items-center gap-2.5 max-w-md">
+          <div className="no-print fixed bottom-5 left-5 z-50 bg-slate-900 dark:bg-slate-800 text-white px-4 py-3 rounded-xl shadow-xl border border-slate-700/80 flex items-center gap-2.5 max-w-md">
             <CheckCircle2 size={17} className="text-emerald-400 shrink-0" />
             <span className="text-xs sm:text-sm font-semibold">{toast}</span>
           </div>
@@ -3001,7 +3175,7 @@ export default function App() {
         {/* FILTER RENEWAL MODAL (With Quick Technician & Escort Name History)  */}
         {/* =================================================================== */}
         {showRenewalModal && (
-          <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
+          <div className="no-print fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
             <div
               className={`w-full max-w-md p-6 rounded-2xl shadow-2xl border my-auto ${
                 darkMode
@@ -3223,7 +3397,7 @@ export default function App() {
         {/* QR CODE LABEL MODAL PER DISPENSER (OFFLINE READY)                   */}
         {/* =================================================================== */}
         {showQrModal && currentLocation && currentArea && (
-          <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="no-print fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4">
             <div
               className={`w-full max-w-sm p-6 rounded-2xl shadow-2xl border text-center ${
                 darkMode
@@ -3285,7 +3459,7 @@ export default function App() {
         {/* =================================================================== */}
         {lightboxPhoto && (
           <div
-            className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-4"
+            className="no-print fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-4"
             onClick={() => setLightboxPhoto(null)}
           >
             <div
@@ -3327,8 +3501,8 @@ export default function App() {
         {/* OFFICIAL A4 PRINTABLE / PDF INSPECTION REPORT MODAL                 */}
         {/* =================================================================== */}
         {showReportModal && (
-          <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-sm flex items-center justify-center p-2 sm:p-4 overflow-y-auto">
-            <div className="w-full max-w-5xl bg-white text-slate-900 rounded-2xl shadow-2xl border border-slate-200 overflow-hidden my-auto">
+          <div className="print-reset fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-sm flex items-center justify-center p-2 sm:p-4 overflow-y-auto">
+            <div className="print-reset w-full max-w-5xl bg-white text-slate-900 rounded-2xl shadow-2xl border border-slate-200 overflow-hidden my-auto">
               {/* Top Modal Toolbar (Hidden when printing) */}
               <div className="no-print px-5 py-3.5 bg-slate-900 text-white flex flex-wrap items-center justify-between gap-3">
                 <div className="flex items-center gap-2.5">
@@ -3363,7 +3537,7 @@ export default function App() {
               <div
                 id="aquaops-printable-report"
                 dir="rtl"
-                className="p-6 sm:p-10 space-y-6 max-h-[82vh] overflow-y-auto bg-white text-slate-900"
+                className="print-reset p-6 sm:p-10 space-y-6 max-h-[82vh] overflow-y-auto bg-white text-slate-900"
               >
                 {/* Official Report Header */}
                 <div className="border-b-2 border-slate-900 pb-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -3484,7 +3658,7 @@ export default function App() {
                               {d.filterMaga}
                             </td>
                             <td className="py-2 px-2 border-l border-slate-300 font-mono">
-                              {d.filterAlef1}% / {d.filterAlef2}%
+                              {toPercent(d.filterAlef1, 100)}% / {toPercent(d.filterAlef2, 100)}%
                             </td>
                             <td className="py-2 px-2 border-l border-slate-300 font-mono">
                               {d.tagExpiry ? formatDateIL(d.tagExpiry) : '-'}
@@ -3522,7 +3696,7 @@ export default function App() {
 
         {/* CUSTOM CONFIRMATION MODAL (Delete / Reset) */}
         {confirmModal.isOpen && (
-          <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="no-print fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4">
             <div
               className={`w-full max-w-md p-6 rounded-2xl shadow-2xl border ${
                 darkMode
@@ -3562,7 +3736,7 @@ export default function App() {
         {/* =================================================================== */}
         {/* WORKSPACE BODY                                                      */}
         {/* =================================================================== */}
-        <main className="flex-1 max-w-[1520px] w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
+        <main className="no-print flex-1 max-w-[1520px] w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
           {/* ================================================================= */}
           {/* VIEW 1: TRACKER (Action Center + Areas Bar + Master-Detail View)  */}
           {/* ================================================================= */}
@@ -3637,7 +3811,10 @@ export default function App() {
                               onChange={(e) => setEditingAreaNameValue(e.target.value)}
                               className="w-28 px-2.5 py-1 rounded-lg bg-white text-slate-900 text-xs font-semibold outline-none"
                               autoFocus
-                              onKeyDown={(e) => e.key === 'Enter' && handleSaveAreaRename(area.id)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') handleSaveAreaRename(area.id);
+                                if (e.key === 'Escape') setEditingAreaId(null);
+                              }}
                             />
                             <button
                               onClick={() => handleSaveAreaRename(area.id)}
@@ -3717,7 +3894,13 @@ export default function App() {
                         placeholder="שם או מספר אזור..."
                         value={newAreaName}
                         onChange={(e) => setNewAreaName(e.target.value)}
-                        onKeyDown={(e) => e.key === 'Enter' && handleAddArea()}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') handleAddArea();
+                          if (e.key === 'Escape') {
+                            setIsAddingArea(false);
+                            setNewAreaName('');
+                          }
+                        }}
                         className={`w-36 px-2.5 py-1.5 rounded-lg text-xs font-medium outline-none ${
                           darkMode ? 'bg-slate-800 text-white' : 'bg-slate-50 text-slate-900'
                         }`}
@@ -3807,9 +3990,10 @@ export default function App() {
                                   onChange={(e) => setEditingLocationNameValue(e.target.value)}
                                   className={`flex-1 min-w-0 px-2.5 py-1.5 rounded-lg border text-xs font-semibold outline-none ${saasInput}`}
                                   autoFocus
-                                  onKeyDown={(e) =>
-                                    e.key === 'Enter' && handleSaveLocationRename(loc.id)
-                                  }
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') handleSaveLocationRename(loc.id);
+                                    if (e.key === 'Escape') setEditingLocationId(null);
+                                  }}
                                 />
                                 <button
                                   onClick={() => handleSaveLocationRename(loc.id)}
@@ -3901,7 +4085,14 @@ export default function App() {
                             placeholder="שם פריט / מתקן מים..."
                             value={newItemName}
                             onChange={(e) => setNewItemName(e.target.value)}
-                            onKeyDown={(e) => e.key === 'Enter' && handleAddLocation()}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') handleAddLocation();
+                              if (e.key === 'Escape') {
+                                setIsAddingLocation(false);
+                                setNewLocName('');
+                                setNewItemName('');
+                              }
+                            }}
                             className={`w-full px-3 py-2 rounded-lg border text-xs font-medium outline-none ${saasInput}`}
                           />
                           <div className="flex gap-2">
@@ -4043,12 +4234,12 @@ export default function App() {
                               {
                                 key: 'filterAlef1',
                                 title: 'פילטר אלף 1 (%)',
-                                val: currentLocation.filterAlef1
+                                val: toPercent(currentLocation.filterAlef1, 100)
                               },
                               {
                                 key: 'filterAlef2',
                                 title: 'פילטר אלף 2 (%)',
-                                val: currentLocation.filterAlef2
+                                val: toPercent(currentLocation.filterAlef2, 100)
                               }
                             ].map((flt) => {
                               const shade = getFilterShade(flt.val);
@@ -4122,7 +4313,7 @@ export default function App() {
                             })}
                           </div>
 
-                          {/* Segmented Controls: Filter Maga & System Type ('טורי' / 'מקבילי') */}
+                          {/* Segmented Controls: Filter Maga & System Type */}
                           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
                             <div className="space-y-1.5">
                               <label className="block text-xs font-semibold opacity-75">
@@ -4136,7 +4327,7 @@ export default function App() {
                                     key={status}
                                     onClick={() => handleUpdateField('filterMaga', status)}
                                     className={`py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer ${
-                                      currentLocation.filterMaga === status
+                                      (currentLocation.filterMaga || 'תקין') === status
                                         ? status === 'תקין'
                                           ? 'bg-emerald-600 text-white shadow-sm'
                                           : 'bg-rose-600 text-white shadow-sm'
@@ -4161,7 +4352,7 @@ export default function App() {
                                     key={sysType}
                                     onClick={() => handleUpdateField('systemType', sysType)}
                                     className={`py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer ${
-                                      currentLocation.systemType === sysType
+                                      (currentLocation.systemType || 'טורי') === sysType
                                         ? 'bg-indigo-600 text-white shadow-sm'
                                         : 'opacity-65 hover:opacity-100'
                                     }`}
@@ -4181,7 +4372,7 @@ export default function App() {
                               </label>
                               <input
                                 type="date"
-                                value={currentLocation.tagExpiry}
+                                value={currentLocation.tagExpiry || ''}
                                 onChange={(e) => handleUpdateField('tagExpiry', e.target.value)}
                                 className={`w-full px-3 py-2 rounded-xl border text-xs font-semibold outline-none transition ${saasInput}`}
                               />
@@ -4192,7 +4383,7 @@ export default function App() {
                                 סוג שעון:
                               </label>
                               <select
-                                value={currentLocation.clockType}
+                                value={currentLocation.clockType || 'דיגיטלי'}
                                 onChange={(e) => handleUpdateField('clockType', e.target.value)}
                                 className={`w-full px-3 py-2 rounded-xl border text-xs font-semibold outline-none transition ${saasInput}`}
                               >
@@ -4233,7 +4424,7 @@ export default function App() {
                                     key={status}
                                     onClick={() => handleUpdateField('tankSensitivity', status)}
                                     className={`py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer ${
-                                      currentLocation.tankSensitivity === status
+                                      (currentLocation.tankSensitivity || 'תקין') === status
                                         ? status === 'תקין'
                                           ? 'bg-emerald-600 text-white shadow-sm'
                                           : 'bg-rose-600 text-white shadow-sm'
@@ -4259,7 +4450,7 @@ export default function App() {
                                     key={status}
                                     onClick={() => handleUpdateField('cartridgeCarriage', status)}
                                     className={`py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer ${
-                                      currentLocation.cartridgeCarriage === status
+                                      (currentLocation.cartridgeCarriage || 'יש עגלה') === status
                                         ? 'bg-indigo-600 text-white shadow-sm'
                                         : 'opacity-65 hover:opacity-100'
                                     }`}
@@ -4277,7 +4468,7 @@ export default function App() {
                               </label>
                               <input
                                 type="date"
-                                value={currentLocation.tankTagExpiry}
+                                value={currentLocation.tankTagExpiry || ''}
                                 onChange={(e) => handleUpdateField('tankTagExpiry', e.target.value)}
                                 className={`w-full px-3 py-2 rounded-xl border text-xs font-semibold outline-none transition ${saasInput}`}
                               />
@@ -4295,7 +4486,7 @@ export default function App() {
                               <h3 className="text-sm font-bold">הערות</h3>
                             </div>
                             <textarea
-                              value={currentLocation.notes}
+                              value={currentLocation.notes || ''}
                               onChange={(e) => handleUpdateField('notes', e.target.value)}
                               placeholder="הוסף הערות תפעול, תקלות או דגשים עבור המתקן והמיכל..."
                               className={`flex-1 w-full p-3 rounded-xl border resize-none text-xs font-medium outline-none transition ${saasInput}`}
@@ -4790,12 +4981,12 @@ export default function App() {
                               <td className="py-3.5 px-4">
                                 <span
                                   className={`px-2 py-0.5 rounded-full text-[11px] font-semibold ${
-                                    item.filterMaga === 'תקין'
+                                    (item.filterMaga || 'תקין') === 'תקין'
                                       ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
                                       : 'bg-rose-500/10 text-rose-600 dark:text-rose-400'
                                   }`}
                                 >
-                                  {item.filterMaga}
+                                  {item.filterMaga || 'תקין'}
                                 </span>
                               </td>
                               <td className="py-3.5 px-4 font-mono tabular-nums">
@@ -4898,12 +5089,12 @@ export default function App() {
                                 <div className="space-y-0.5">
                                   <span
                                     className={`block font-semibold ${
-                                      item.tankSensitivity === 'תקין'
+                                      (item.tankSensitivity || 'תקין') === 'תקין'
                                         ? 'text-emerald-600 dark:text-emerald-400'
                                         : 'text-rose-600 dark:text-rose-400'
                                     }`}
                                   >
-                                    {item.tankSensitivity}
+                                    {item.tankSensitivity || 'תקין'}
                                   </span>
                                   <span className="block text-[11px] opacity-65">
                                     {item.cartridgeCarriage} | תוקף:{' '}
